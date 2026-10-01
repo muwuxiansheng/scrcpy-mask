@@ -12,3 +12,9 @@ assets/lib
 .codex
 AGENTS.md
 CLAUDE.md
+
+# Local downloads and generated phone-pointer artifacts
+/FFmpeg-n7.1.2/
+/FFmpeg-n7.1.2.tar.gz
+/phone-pointer/*.class
+/assets/mask-pointer.jar

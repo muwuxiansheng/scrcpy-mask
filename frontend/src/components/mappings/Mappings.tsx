@@ -69,6 +69,7 @@ import ButtonCancelCast from "./ButtonCancelCast";
 import ButtonObservation from "./ButtonObservation";
 import ButtonFps from "./ButtonFps";
 import ButtonRawInput from "./ButtonRawInput";
+import ButtonDevicePointer from "./ButtonDevicePointer";
 import { setActiveMappingFile } from "../../store/localConfig";
 import { useTranslation } from "react-i18next";
 import { ItemBox, ItemBoxContainer } from "../common/ItemBox";
@@ -479,6 +480,7 @@ const buttonTypes = [
   "CancelCast",
   "Observation",
   "Fps",
+  "DevicePointer",
   "Fire",
   "RawInput",
   "Script",
@@ -495,6 +497,7 @@ const mappingButtonMap = {
   CancelCast: ButtonCancelCast,
   Observation: ButtonObservation,
   Fps: ButtonFps,
+  DevicePointer: ButtonDevicePointer,
   Fire: ButtonFire,
   RawInput: ButtonRawInput,
   Script: ButtonScript,

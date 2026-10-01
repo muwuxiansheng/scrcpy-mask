@@ -292,6 +292,13 @@
       },
       "name": "Fire"
     },
+    "devicePointer": {
+      "name": "Phone pointer",
+      "setting": {
+        "title": "Mapping configuration - Phone pointer",
+        "hint": "While FPS mouse control is on, press the bound key to switch between phone pointer and FPS view. The marker sets the starting position on each activation. Left click sends touch; hold and move to drag. Avoid bindings shared with F8, left click or other mappings."
+      }
+    },
     "fps": {
       "setting": {
         "sensitivity": "Sensitivity",

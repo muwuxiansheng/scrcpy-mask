@@ -205,6 +205,7 @@ fn apply_single_tap_up(
 
 pub fn handle_single_tap(
     ineffable: Res<Ineffable>,
+    pointer: Res<super::device_pointer::DevicePointer>,
     active_mapping: Res<ActiveMappingConfig>,
     mut active_single_tap: ResMut<ActiveSingleTapMap>,
     cs_tx_res: Res<ChannelSenderCS>,
@@ -222,6 +223,9 @@ pub fn handle_single_tap(
             if action.as_ref().starts_with("SingleTap") {
                 let original_size: Vec2 = active_mapping.original_size.into();
                 let mapping = mapping.as_ref_singletap();
+                if pointer.active && mapping.bind.has_mouse_binding() {
+                    continue;
+                }
                 if ineffable.just_activated(action.ineff_continuous()) {
                     if mapping.sync {
                         if single_tap_has_before_hook(mapping) {

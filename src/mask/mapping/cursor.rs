@@ -88,6 +88,7 @@ impl Plugin for CursorPlugins {
     fn build(&self, app: &mut App) {
         app.insert_resource(CursorPosition((0., 0.).into()))
             .insert_resource(NormalCursorCapture::default())
+            .init_resource::<super::device_pointer::DevicePointer>()
             .insert_state(CursorState::Normal)
             .insert_resource(IgnoreFirstMotion(false))
             .insert_resource(ActiveCursorFpsConfig::default())
@@ -129,6 +130,47 @@ impl Plugin for CursorPlugins {
                             .and_then(run_if_handle_cursor_fps)
                             .and_then(mask_not_resizing),
                     ),
+            )
+            .add_systems(
+                Update,
+                sync_fps_cursor_capture_window
+                    .before(handle_cursor_fps)
+                    .before(super::device_pointer::handle_pointer_motion)
+                    .run_if(in_state(CursorState::Fps).and_then(in_state(MappingState::Normal))),
+            )
+            .add_systems(
+                Update,
+                (
+                    super::tap::cleanup_tap_on_stop,
+                    super::direction_pad::cleanup_direction_pad_on_stop,
+                    super::observation::cleanup_observation_on_stop,
+                    super::cast_spell::cleanup_cast_spell_on_stop,
+                    super::fire::cleanup_fire_on_stop,
+                    super::script::cleanup_script_on_stop,
+                    super::device_pointer::toggle_pointer,
+                )
+                    .chain()
+                    .before(CursorFrameSet::UpdatePosition)
+                    .run_if(
+                        in_state(CursorState::Fps)
+                            .and_then(in_state(MappingState::Normal))
+                            .and_then(mask_not_resizing)
+                            .and_then(super::device_pointer::toggle_requested),
+                    ),
+            )
+            .add_systems(
+                Update,
+                super::device_pointer::handle_pointer_motion
+                    .in_set(CursorFrameSet::UpdatePosition)
+                    .run_if(
+                        in_state(CursorState::Fps)
+                            .and_then(in_state(MappingState::Normal))
+                            .and_then(mask_not_resizing),
+                    ),
+            )
+            .add_systems(
+                OnExit(CursorState::Fps),
+                super::device_pointer::cleanup_pointer,
             )
             .add_systems(OnEnter(CursorState::Fps), on_enter_cursor_fps)
             .add_systems(OnExit(CursorState::Fps), on_exit_cursor_fps);
@@ -507,12 +549,42 @@ fn on_enter_cursor_fps(
     cursor_options.grab_mode = CursorGrabMode::Locked;
     cursor_options.visible = false;
 
-    if window.cursor_position().is_none() {
-        window.set_cursor_position(Some(center_pos + Vec2::new(0., titlebar_state.offset())));
-        ignore_first_motion.0 = true;
-    }
+    window.set_cursor_position(Some(center_pos + Vec2::new(0., titlebar_state.offset())));
+    ignore_first_motion.0 = true;
 
     cursor_pos.0 = center_pos;
+}
+
+// Re-establish capture and touch after focus changes. Do not steal focus from other apps.
+fn sync_fps_cursor_capture_window(
+    window: Single<(&mut Window, &mut CursorOptions)>,
+    mut was_focused: Local<bool>,
+    mut cursor_pos: ResMut<CursorPosition>,
+    mut fps_config: ResMut<ActiveCursorFpsConfig>,
+    mut ignore_first_motion: ResMut<IgnoreFirstMotion>,
+    mask_size: Res<MaskSize>,
+    titlebar_state: Res<TitlebarState>,
+    cs_tx: Res<ChannelSenderCS>,
+) {
+    let (mut window, mut options) = window.into_inner();
+    if !window.focused {
+        if *was_focused {
+            release_fps_touches(&cs_tx.0, &mut fps_config, mask_size.0, cursor_pos.0);
+        }
+        options.grab_mode = CursorGrabMode::None;
+        options.visible = true;
+        *was_focused = false;
+        return;
+    }
+    if !*was_focused {
+        release_fps_touches(&cs_tx.0, &mut fps_config, mask_size.0, cursor_pos.0);
+        cursor_pos.0 = fps_center_pos(&fps_config, mask_size.0);
+        window.set_cursor_position(Some(cursor_pos.0 + Vec2::new(0., titlebar_state.offset())));
+        ignore_first_motion.0 = true;
+    }
+    options.grab_mode = CursorGrabMode::Locked;
+    options.visible = false;
+    *was_focused = true;
 }
 
 fn on_exit_cursor_fps(
@@ -534,7 +606,7 @@ fn on_exit_cursor_fps(
 }
 
 #[derive(Resource)]
-struct IgnoreFirstMotion(bool);
+pub(super) struct IgnoreFirstMotion(pub(super) bool);
 
 pub const FPS_MARGIN: f32 = 25.;
 const FPS_MAX_RECENTER_ITERATIONS: usize = 4;
@@ -542,9 +614,10 @@ const FPS_MAX_RECENTER_ITERATIONS: usize = 4;
 fn run_if_handle_cursor_fps(
     window: Single<&Window>,
     fps_config: Res<ActiveCursorFpsConfig>,
+    pointer: Res<super::device_pointer::DevicePointer>,
 ) -> bool {
-    // fire key is not pressed and window is focused
-    !fps_config.ignore_fps_motion && window.focused
+    // Pointer mode owns mouse motion while FPS remains the master capture state.
+    !pointer.active && !fps_config.ignore_fps_motion && window.focused
 }
 
 fn physical_bounds(mask_size: Vec2) -> (Vec2, Vec2) {
@@ -621,8 +694,11 @@ fn send_fps_touch(
     pointer_id: u64,
     mask_size: Vec2,
     pos: Vec2,
+    original_size: Vec2,
 ) {
-    ControlMsgHelper::send_touch(cs_tx, action, pointer_id, mask_size, pos);
+    // Quantize at the phone/profile resolution, not at the smaller overlay resolution.
+    let device_pos = pos / mask_size * original_size;
+    ControlMsgHelper::send_touch(cs_tx, action, pointer_id, original_size, device_pos);
 }
 
 fn cleanup_pending_fps_touch(
@@ -649,7 +725,14 @@ fn cleanup_pending_fps_touch(
             deferred_delta,
             ..
         }) => {
-            send_fps_touch(cs_tx, MotionEventAction::Down, pointer_id, mask_size, pos);
+            send_fps_touch(
+                cs_tx,
+                MotionEventAction::Down,
+                pointer_id,
+                mask_size,
+                pos,
+                fps_config.original_size,
+            );
             fps_config.touch_active = true;
             Some(deferred_delta)
         }
@@ -659,7 +742,14 @@ fn cleanup_pending_fps_touch(
             deferred_delta,
             ..
         }) => {
-            send_fps_touch(cs_tx, MotionEventAction::Up, pointer_id, mask_size, pos);
+            send_fps_touch(
+                cs_tx,
+                MotionEventAction::Up,
+                pointer_id,
+                mask_size,
+                pos,
+                fps_config.original_size,
+            );
             Some(deferred_delta)
         }
         Some(PendingFpsTouch::Overlap { .. }) | None => None,
@@ -683,8 +773,22 @@ fn consume_overlap_fps_touch(
 
     let (physical_min, physical_max) = physical_bounds(mask_size);
     let pos = clamp_to_bounds(pos + delta, physical_min, physical_max);
-    send_fps_touch(cs_tx, MotionEventAction::Move, pointer_id, mask_size, pos);
-    send_fps_touch(cs_tx, MotionEventAction::Up, pointer_id, mask_size, pos);
+    send_fps_touch(
+        cs_tx,
+        MotionEventAction::Move,
+        pointer_id,
+        mask_size,
+        pos,
+        fps_config.original_size,
+    );
+    send_fps_touch(
+        cs_tx,
+        MotionEventAction::Up,
+        pointer_id,
+        mask_size,
+        pos,
+        fps_config.original_size,
+    );
     fps_config.pending_touch = None;
     Some(deferred_delta + delta)
 }
@@ -729,7 +833,14 @@ fn recenter_fps_touch(
             | PendingFpsTouch::Overlap {
                 pointer_id, pos, ..
             } => {
-                send_fps_touch(cs_tx, MotionEventAction::Up, pointer_id, mask_size, pos);
+                send_fps_touch(
+                    cs_tx,
+                    MotionEventAction::Up,
+                    pointer_id,
+                    mask_size,
+                    pos,
+                    fps_config.original_size,
+                );
             }
         }
     }
@@ -742,6 +853,7 @@ fn recenter_fps_touch(
                 fps_config.active_pointer_id,
                 mask_size,
                 old_pos,
+                fps_config.original_size,
             );
             fps_config.touch_active = false;
             if interval > 0 {
@@ -759,6 +871,7 @@ fn recenter_fps_touch(
                 fps_config.active_pointer_id,
                 mask_size,
                 center_pos,
+                fps_config.original_size,
             );
             fps_config.touch_active = true;
         }
@@ -774,6 +887,7 @@ fn recenter_fps_touch(
                 new_pointer_id,
                 mask_size,
                 center_pos,
+                fps_config.original_size,
             );
             fps_config.active_pointer_id = new_pointer_id;
             if interval > 0 {
@@ -791,6 +905,7 @@ fn recenter_fps_touch(
                 old_pointer_id,
                 mask_size,
                 old_pos,
+                fps_config.original_size,
             );
         }
         FpsTouchMode::Dual {
@@ -805,6 +920,7 @@ fn recenter_fps_touch(
                 new_pointer_id,
                 mask_size,
                 center_pos,
+                fps_config.original_size,
             );
             fps_config.pending_touch = Some(PendingFpsTouch::Overlap {
                 pointer_id: old_pointer_id,
@@ -854,6 +970,7 @@ fn apply_fps_delta(
                 fps_config.active_pointer_id,
                 mask_size,
                 new_pos,
+                fps_config.original_size,
             );
             return new_pos;
         };
@@ -869,6 +986,7 @@ fn apply_fps_delta(
             fps_config.active_pointer_id,
             mask_size,
             touch_pos,
+            fps_config.original_size,
         );
 
         match recenter_fps_touch(cs_tx, fps_config, mask_size, touch_pos, remaining_delta) {
@@ -892,6 +1010,7 @@ fn handle_cursor_fps(
     mut ignore_first_motion: ResMut<IgnoreFirstMotion>,
     mask_size: Res<MaskSize>,
     cs_tx_res: Res<ChannelSenderCS>,
+    mut last_motion: Local<Option<Instant>>,
 ) {
     if ignore_first_motion.0 {
         ignore_first_motion.0 = false;
@@ -899,6 +1018,26 @@ fn handle_cursor_fps(
     }
 
     let delta = accumulated_motion.delta * fps_config.sensitivity;
+
+    // An idle touch may belong to a game UI that has already been dismissed.
+    // Release it while idle, then start a fresh gesture on the next real movement.
+    let now = Instant::now();
+    if delta == Vec2::ZERO {
+        if last_motion.is_none() && fps_config.touch_active && fps_config.pending_touch.is_none() {
+            *last_motion = Some(now);
+        }
+        if last_motion.is_some_and(|last| now.duration_since(last) >= Duration::from_millis(150)) {
+            release_fps_touches(&cs_tx_res.0, &mut fps_config, mask_size.0, cursor_pos.0);
+            *last_motion = None;
+            return;
+        }
+    } else {
+        *last_motion = Some(now);
+        if !fps_config.touch_active && fps_config.pending_touch.is_none() {
+            restore_fps_touch(&cs_tx_res.0, &mut fps_config);
+            cursor_pos.0 = fps_center_pos(&fps_config, mask_size.0);
+        }
+    }
 
     if let Some(deferred_delta) =
         cleanup_pending_fps_touch(&cs_tx_res.0, &mut fps_config, mask_size.0)
@@ -986,6 +1125,120 @@ fn handle_normal_left_click(
 mod tests {
     use super::*;
     use tokio::sync::broadcast::error::TryRecvError;
+
+    fn recovery_app() -> (App, broadcast::Receiver<ScrcpyControlMsg>) {
+        let (tx, rx) = broadcast::channel(32);
+        let mut app = App::new();
+        app.insert_resource(ChannelSenderCS(tx))
+            .insert_resource(fps_config(FpsTouchMode::Single { interval: 0 }))
+            .insert_resource(CursorPosition(Vec2::new(540.0, 500.0)))
+            .insert_resource(MaskSize(Vec2::splat(1000.0)))
+            .insert_resource(TitlebarState { visible: false })
+            .insert_resource(IgnoreFirstMotion(false))
+            .insert_resource(AccumulatedMouseMotion::default());
+        (app, rx)
+    }
+
+    #[test]
+    fn focus_loss_releases_touch_and_focus_return_locks_cursor() {
+        let (mut app, mut rx) = recovery_app();
+        let entity = app
+            .world_mut()
+            .spawn((
+                Window {
+                    focused: true,
+                    ..default()
+                },
+                CursorOptions::default(),
+            ))
+            .id();
+        app.add_systems(Update, sync_fps_cursor_capture_window);
+        app.update();
+        assert_eq!(
+            app.world().get::<CursorOptions>(entity).unwrap().grab_mode,
+            CursorGrabMode::Locked
+        );
+        app.world_mut().get_mut::<Window>(entity).unwrap().focused = false;
+        app.update();
+        assert!(!app.world().resource::<ActiveCursorFpsConfig>().touch_active);
+        assert_eq!(
+            app.world().get::<CursorOptions>(entity).unwrap().grab_mode,
+            CursorGrabMode::None
+        );
+        app.world_mut().get_mut::<Window>(entity).unwrap().focused = true;
+        app.update();
+        assert_eq!(
+            app.world().get::<CursorOptions>(entity).unwrap().grab_mode,
+            CursorGrabMode::Locked
+        );
+        assert_vec2_near(
+            app.world().resource::<CursorPosition>().0,
+            Vec2::splat(500.0),
+        );
+        assert!(!collect_touch_events(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn idle_touch_is_released_and_first_motion_restarts_it() {
+        let (mut app, mut rx) = recovery_app();
+        app.add_systems(Update, handle_cursor_fps);
+        app.update();
+        std::thread::sleep(Duration::from_millis(160));
+        app.update();
+        assert!(!app.world().resource::<ActiveCursorFpsConfig>().touch_active);
+        app.world_mut()
+            .resource_mut::<AccumulatedMouseMotion>()
+            .delta = Vec2::new(1.0, 1.0);
+        app.update();
+        let events = collect_touch_events(&mut rx);
+        assert_eq!(
+            events.iter().map(|event| event.0).collect::<Vec<_>>(),
+            vec![
+                MotionEventAction::Up,
+                MotionEventAction::Down,
+                MotionEventAction::Move
+            ]
+        );
+        assert_vec2_near(
+            app.world().resource::<CursorPosition>().0,
+            Vec2::new(501.0, 501.0),
+        );
+    }
+
+    #[test]
+    fn fps_motion_preserves_subpixel_overlay_movement() {
+        let (tx, mut rx) = broadcast::channel(16);
+        send_fps_touch(
+            &tx,
+            MotionEventAction::Move,
+            0,
+            Vec2::new(1280.0, 906.0),
+            Vec2::new(500.5, 300.5),
+            Vec2::new(3392.0, 2400.0),
+        );
+        let events = collect_touch_events(&mut rx);
+        assert_eq!((events[0].2, events[0].3), (1326, 796));
+    }
+
+    #[test]
+    fn idle_resume_starts_a_fresh_touch_at_the_anchor() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut config = fps_config(FpsTouchMode::Single { interval: 0 });
+        release_fps_touches(
+            &tx,
+            &mut config,
+            Vec2::splat(1000.0),
+            Vec2::new(540.0, 500.0),
+        );
+        assert!(!config.touch_active);
+        restore_fps_touch(&tx, &mut config);
+        let events = collect_touch_events(&mut rx);
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0].0, MotionEventAction::Up));
+        assert!(matches!(events[1].0, MotionEventAction::Down));
+        assert_eq!((events[1].2, events[1].3), (500, 500));
+        assert!(config.touch_active);
+    }
 
     fn fps_config(touch_mode: FpsTouchMode) -> ActiveCursorFpsConfig {
         ActiveCursorFpsConfig {

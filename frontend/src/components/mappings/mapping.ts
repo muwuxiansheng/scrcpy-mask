@@ -27,6 +27,7 @@ export type MappingType =
   | FpsConfig
   | FireConfig
   | RawInputConfig
+  | DevicePointerConfig
   | ScriptConfig;
 
 export type Position = {
@@ -485,6 +486,17 @@ export function newRawInput(position: Position): RawInputConfig {
     position,
     type: "RawInput",
   };
+}
+
+export interface DevicePointerConfig {
+  id: string;
+  bind: ButtonBinding;
+  note: string;
+  position: Position;
+  type: "DevicePointer";
+}
+export function newDevicePointer(position: Position): DevicePointerConfig {
+  return { id: newMappingId(), bind: [], note: "", position, type: "DevicePointer" };
 }
 
 export interface ScriptConfig {

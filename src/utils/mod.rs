@@ -30,11 +30,12 @@ where
     P: IntoIterator,
     P::Item: AsRef<Path>,
 {
-    segments
-        .into_iter()
-        .fold(dirs::data_dir().unwrap().join(IDENTIFIER), |acc, seg| {
-            acc.join(seg)
-        })
+    // Optional isolated profile storage for portable/test builds.
+    let root = env::var_os("SCRCPY_MASK_DATA_DIR")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| dirs::data_dir().unwrap().join(IDENTIFIER));
+    segments.into_iter().fold(root, |acc, seg| acc.join(seg))
 }
 
 pub fn relate_to_root_path<P>(segments: P) -> PathBuf

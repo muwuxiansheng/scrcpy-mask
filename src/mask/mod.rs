@@ -256,6 +256,11 @@ fn sync_mask_position(
                 let WindowPosition::At(pos) = window.position else {
                     return;
                 };
+                // Windows reports this sentinel while minimized; it is not a saved desktop position.
+                #[cfg(target_os = "windows")]
+                if pos.x == -32000 && pos.y == -32000 {
+                    return;
+                }
                 let scale_factor = window.resolution.scale_factor() as f32;
                 let content_top = if titlebar_state.visible {
                     physical_to_logical_i32(pos.y, scale_factor) + TITLEBAR_HEIGHT.round() as i32

@@ -2,6 +2,7 @@ pub mod binding;
 pub mod cast_spell;
 pub mod config;
 pub mod cursor;
+pub mod device_pointer;
 pub mod direction_pad;
 pub mod executor;
 pub mod fire;
@@ -102,15 +103,21 @@ impl Plugin for MappingPlugins {
                     observation::handle_observation,
                     observation::handle_observation_trigger,
                     observation::handle_observation_focus_lost,
-                    fire::handle_fps,
                     // raw input won't work in fps mode
                     raw_input::handle_raw_input.run_if(not(in_state(CursorState::Fps))),
                     // fire only works in fps mode
-                    (fire::handle_fire, fire::handle_fire_trigger)
-                        .run_if(in_state(CursorState::Fps)),
+                    (fire::handle_fire, fire::handle_fire_trigger).run_if(
+                        in_state(CursorState::Fps).and_then(not(device_pointer::pointer_active)),
+                    ),
                     script::handle_script,
                     script::handle_script_trigger,
                 )
+                    .in_set(CursorFrameSet::HandleMappings)
+                    .run_if(in_state(MappingState::Normal)),
+            )
+            .add_systems(
+                Update,
+                fire::handle_fps
                     .in_set(CursorFrameSet::HandleMappings)
                     .run_if(in_state(MappingState::Normal)),
             )

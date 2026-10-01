@@ -754,6 +754,9 @@ async fn migrate_mapping(
             MappingType::RawInput(m) => {
                 m.position *= scale;
             }
+            MappingType::DevicePointer(m) => {
+                m.position *= scale;
+            }
             MappingType::Script(m) => {
                 m.position *= scale;
             }

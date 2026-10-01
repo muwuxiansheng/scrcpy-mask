@@ -1,3 +1,5 @@
+本分支的手机指针与 FPS 改进说明见 [修改版说明](CUSTOMIZATION-zh.md)。
+
 # Scrcpy Mask
 
 [English](./README.md)

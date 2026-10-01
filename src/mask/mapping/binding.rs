@@ -282,6 +282,15 @@ impl<'de> Deserialize<'de> for MergedButton {
 pub struct ButtonBinding(Vec<MergedButton>);
 
 impl ButtonBinding {
+    pub fn has_mouse_binding(&self) -> bool {
+        self.0.iter().any(|button| {
+            matches!(
+                button,
+                MergedButton::Mouse(_) | MergedButton::ScrollDown | MergedButton::ScrollUp
+            )
+        })
+    }
+
     pub fn new(buttons: Vec<MergedButton>) -> Self {
         ButtonBinding(buttons)
     }

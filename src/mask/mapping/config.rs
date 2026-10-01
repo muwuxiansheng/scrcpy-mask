@@ -27,6 +27,7 @@ use crate::{
             MappingCancelCast, MappingMouseCastSpell, MappingPadCastSpell,
         },
         cursor::FPS_MARGIN,
+        device_pointer::{BindMappingDevicePointer, MappingDevicePointer},
         direction_pad::{BindMappingDirectionPad, MappingDirectionPad},
         fire::{BindMappingFire, BindMappingFps, MappingFire, MappingFps},
         observation::{BindMappingObservation, MappingObservation},
@@ -74,6 +75,8 @@ seq!(N in 1..=32 {
             Observation~N,
             #[ineffable(pulse)]
             Fps~N,
+            #[ineffable(pulse)]
+            DevicePointer~N,
             #[ineffable(continuous)]
             Fire~N,
             #[ineffable(pulse)]
@@ -106,6 +109,7 @@ seq!(N in 1..=32 {
                     MappingAction::Swipe~N => self.clone()._swipe~N(),
                     MappingAction::CancelCast~N => self.clone()._cancelcast~N(),
                     MappingAction::Fps~N => self.clone()._fps~N(),
+                    MappingAction::DevicePointer~N => self.clone()._devicepointer~N(),
                     MappingAction::RawInput~N => self.clone()._rawinput~N(),
                 )*
                 _ => panic!("ineff_pulse called on non-pulse variant"),
@@ -208,6 +212,7 @@ impl_mapping_related! {
     CancelCast,
     Observation,
     Fps,
+    DevicePointer,
     Fire,
     RawInput,
     Script
@@ -353,6 +358,7 @@ impl BindMappingConfig {
                     BindMappingType::CancelCast(m) => (m.bind.to_string(), m.position.into()),
                     BindMappingType::Observation(m) => (m.bind.to_string(), m.position.into()),
                     BindMappingType::Fps(m) => (m.bind.to_string(), m.position.into()),
+                    BindMappingType::DevicePointer(m) => (m.bind.to_string(), m.position.into()),
                     BindMappingType::Fire(m) => (m.bind.to_string(), m.position.into()),
                     BindMappingType::RawInput(m) => (m.bind.to_string(), m.position.into()),
                     BindMappingType::Script(m) => (m.bind.to_string(), m.position.into()),
@@ -655,7 +661,7 @@ fn collect_mapping_specific_diagnostics(
                 &mapping.script_hooks,
             );
         }
-        MappingType::RawInput(_) => {}
+        MappingType::RawInput(_) | MappingType::DevicePointer(_) => {}
         MappingType::Script(mapping) => {
             collect_script_field_diagnostics(
                 diagnostics,
