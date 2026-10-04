@@ -92,6 +92,8 @@ impl Plugin for CursorPlugins {
             .insert_state(CursorState::Normal)
             .insert_resource(IgnoreFirstMotion(false))
             .insert_resource(ActiveCursorFpsConfig::default())
+            .add_systems(Update, sync_control_input_surface)
+            .add_systems(Update, super::fps_diagnostics::capture_frame.before(handle_cursor_fps))
             .add_systems(
                 Update,
                 handle_cursor_normal
@@ -257,6 +259,8 @@ pub struct ActiveCursorFpsConfig {
     pub pointer_id: u64,
     pub active_pointer_id: u64,
     pub original_pos: Vec2,
+    pub configured_pos: Vec2,
+    pub start_random_offset: Vec2,
     pub original_size: Vec2,
     pub max_offset: Vec2,
     pub touch_mode: FpsTouchMode,
@@ -272,6 +276,8 @@ impl Default for ActiveCursorFpsConfig {
             pointer_id: 0,
             active_pointer_id: 0,
             original_pos: Vec2::ZERO,
+            configured_pos: Vec2::ZERO,
+            start_random_offset: Vec2::ZERO,
             original_size: Vec2::ZERO,
             max_offset: Vec2::ZERO,
             touch_mode: FpsTouchMode::default(),
@@ -334,7 +340,9 @@ pub fn release_fps_touches(
 pub fn restore_fps_touch(
     cs_tx: &broadcast::Sender<ScrcpyControlMsg>,
     fps_config: &mut ActiveCursorFpsConfig,
+    mask_size: Vec2,
 ) {
+    randomize_fps_start(fps_config, mask_size);
     fps_config.reset_touch_state();
     fps_config.touch_active = true;
     ControlMsgHelper::send_touch(
@@ -344,6 +352,22 @@ pub fn restore_fps_touch(
         fps_config.original_size,
         fps_config.original_pos,
     );
+}
+
+fn sync_control_input_surface(state: Res<State<CursorState>>, mut clear: ResMut<ClearColor>, mut window: Single<&mut Window>) {
+    let mode = if crate::config::LocalConfig::get_vsync() { bevy::window::PresentMode::AutoVsync } else { bevy::window::PresentMode::AutoNoVsync };
+    if window.present_mode != mode {
+        window.present_mode = mode;
+        log::info!("[Window] present mode changed to {mode:?}");
+    }
+    // Zero-alpha pixels in a transparent Windows window may pass mouse clicks
+    // to the window underneath. Keep one alpha step while controlling the phone.
+    let color = if *state.get() == CursorState::Fps {
+        Color::srgba(0.0, 0.0, 0.0, 1.0 / 255.0)
+    } else {
+        Color::NONE
+    };
+    if clear.0 != color { clear.0 = color; }
 }
 
 fn handle_cursor_normal(
@@ -634,9 +658,29 @@ fn fps_center_pos(fps_config: &ActiveCursorFpsConfig, mask_size: Vec2) -> Vec2 {
     fps_config.original_pos / fps_config.original_size * mask_size
 }
 
+pub(super) fn randomize_fps_start(fps: &mut ActiveCursorFpsConfig, mask_size: Vec2) {
+    if fps.start_random_offset == Vec2::ZERO { return; }
+    let (min, max) = fps_effective_bounds(fps, mask_size);
+    let scale = fps.original_size / mask_size;
+    fps.original_pos = Vec2::new(
+        sample_start_axis(fps.configured_pos.x, fps.start_random_offset.x, min.x * scale.x, max.x * scale.x),
+        sample_start_axis(fps.configured_pos.y, fps.start_random_offset.y, min.y * scale.y, max.y * scale.y),
+    );
+}
+
+fn sample_start_axis(base: f32, range: f32, min: f32, max: f32) -> f32 {
+    use rand::Rng;
+    if range <= 0.0 { return base; }
+    // Stay strictly inside the existing swipe bounds, without expanding them.
+    let lo = (base - range).max(min + 0.01);
+    let hi = (base + range).min(max - 0.01);
+    if lo >= hi { return base; }
+    rand::rng().random_range(lo..hi)
+}
+
 fn fps_effective_bounds(fps_config: &ActiveCursorFpsConfig, mask_size: Vec2) -> (Vec2, Vec2) {
     let (physical_min, physical_max) = physical_bounds(mask_size);
-    let center = fps_center_pos(fps_config, mask_size);
+    let center = fps_config.configured_pos / fps_config.original_size * mask_size;
     let scale = mask_size / fps_config.original_size;
     let mut min = physical_min;
     let mut max = physical_max;
@@ -698,7 +742,7 @@ fn send_fps_touch(
 ) {
     // Quantize at the phone/profile resolution, not at the smaller overlay resolution.
     let device_pos = pos / mask_size * original_size;
-    ControlMsgHelper::send_touch(cs_tx, action, pointer_id, original_size, device_pos);
+    super::fps_output::send(cs_tx, action, pointer_id, original_size, device_pos);
 }
 
 fn cleanup_pending_fps_touch(
@@ -822,7 +866,10 @@ fn recenter_fps_touch(
     old_pos: Vec2,
     remaining_delta: Vec2,
 ) -> FpsRecenterResult {
+    randomize_fps_start(fps_config, mask_size);
     let center_pos = fps_center_pos(fps_config, mask_size);
+
+    super::fps_diagnostics::recenter();
 
     if let Some(pending) = fps_config.pending_touch.take() {
         match pending {
@@ -1003,7 +1050,7 @@ fn apply_fps_delta(
     }
 }
 
-fn handle_cursor_fps(
+pub(super) fn handle_cursor_fps(
     accumulated_motion: Res<AccumulatedMouseMotion>,
     mut cursor_pos: ResMut<CursorPosition>,
     mut fps_config: ResMut<ActiveCursorFpsConfig>,
@@ -1011,22 +1058,37 @@ fn handle_cursor_fps(
     mask_size: Res<MaskSize>,
     cs_tx_res: Res<ChannelSenderCS>,
     mut last_motion: Local<Option<Instant>>,
+    recoil: Option<Res<super::recoil::RecoilDelta>>,
+    recoil_runtime: Option<Res<super::recoil::RecoilRuntime>>,
 ) {
     if ignore_first_motion.0 {
         ignore_first_motion.0 = false;
         return;
     }
 
-    let delta = accumulated_motion.delta * fps_config.sensitivity;
+    let recoil_delta = recoil.map_or(Vec2::ZERO, |r| r.0);
+    // Flush the newest sampled position even when the mouse has just stopped.
+    super::fps_output::flush(&cs_tx_res.0);
+    let compensation = if recoil_delta != Vec2::ZERO && fps_config.original_size.min_element() > 0.0 {
+        recoil_delta / fps_config.original_size * mask_size.0
+    } else { Vec2::ZERO };
+    let delta = accumulated_motion.delta * fps_config.sensitivity + compensation;
 
     // An idle touch may belong to a game UI that has already been dismissed.
     // Release it while idle, then start a fresh gesture on the next real movement.
     let now = Instant::now();
-    if delta == Vec2::ZERO {
+    if delta == Vec2::ZERO && recoil_runtime.is_some_and(|r| r.keeps_view_touch()) {
+        *last_motion = Some(now);
+        if !fps_config.touch_active && fps_config.pending_touch.is_none() {
+            restore_fps_touch(&cs_tx_res.0, &mut fps_config, mask_size.0);
+            cursor_pos.0 = fps_center_pos(&fps_config, mask_size.0);
+        }
+    } else if delta == Vec2::ZERO {
         if last_motion.is_none() && fps_config.touch_active && fps_config.pending_touch.is_none() {
             *last_motion = Some(now);
         }
         if last_motion.is_some_and(|last| now.duration_since(last) >= Duration::from_millis(150)) {
+            super::fps_diagnostics::idle_release();
             release_fps_touches(&cs_tx_res.0, &mut fps_config, mask_size.0, cursor_pos.0);
             *last_motion = None;
             return;
@@ -1034,7 +1096,7 @@ fn handle_cursor_fps(
     } else {
         *last_motion = Some(now);
         if !fps_config.touch_active && fps_config.pending_touch.is_none() {
-            restore_fps_touch(&cs_tx_res.0, &mut fps_config);
+            restore_fps_touch(&cs_tx_res.0, &mut fps_config, mask_size.0);
             cursor_pos.0 = fps_center_pos(&fps_config, mask_size.0);
         }
     }
@@ -1126,6 +1188,35 @@ mod tests {
     use super::*;
     use tokio::sync::broadcast::error::TryRecvError;
 
+    #[test]
+    fn randomized_gesture_anchor_stays_bounded_without_drift_and_matches_down() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let mut config = fps_config(FpsTouchMode::Single { interval: 0 });
+        config.start_random_offset = Vec2::new(1000.0, 30.0);
+        for _ in 0..64 {
+            let previous = config.original_pos;
+            release_fps_touches(&tx, &mut config, Vec2::splat(1000.0), previous);
+            restore_fps_touch(&tx, &mut config, Vec2::splat(1000.0));
+            let anchor = config.original_pos;
+            assert_eq!(config.configured_pos, Vec2::splat(500.0));
+            assert!(anchor.x > 450.0 && anchor.x < 550.0);
+            assert!(anchor.y >= 470.0 && anchor.y <= 530.0);
+            let result = apply_fps_delta(&tx, &mut config, Vec2::splat(1000.0), anchor, Vec2::new(0.001, 0.001));
+            assert_eq!(config.original_pos, anchor);
+            assert_vec2_near(result, anchor + Vec2::new(0.001, 0.001));
+            let events = collect_touch_events(&mut rx);
+            let down = events.iter().find(|e| e.0 == MotionEventAction::Down).unwrap();
+            assert_eq!((down.2, down.3), (anchor.x as i32, anchor.y as i32));
+        }
+    }
+
+    #[test]
+    fn zero_start_random_range_preserves_existing_anchor() {
+        let mut config = fps_config(FpsTouchMode::Single { interval: 0 });
+        randomize_fps_start(&mut config, Vec2::splat(1000.0));
+        assert_eq!(config.original_pos, Vec2::splat(500.0));
+    }
+
     fn recovery_app() -> (App, broadcast::Receiver<ScrcpyControlMsg>) {
         let (tx, rx) = broadcast::channel(32);
         let mut app = App::new();
@@ -1206,6 +1297,26 @@ mod tests {
     }
 
     #[test]
+    fn recoil_preserves_fractional_phone_pixels_without_scaling_by_mouse_sensitivity() {
+        let (mut app, mut rx) = recovery_app();
+        app.world_mut().resource_mut::<MaskSize>().0 = Vec2::splat(500.0);
+        app.world_mut().resource_mut::<CursorPosition>().0 = Vec2::splat(250.0);
+        app.world_mut().resource_mut::<ActiveCursorFpsConfig>().sensitivity = Vec2::splat(10.0);
+        app.insert_resource(super::super::recoil::RecoilDelta(Vec2::new(0.0, 0.25)));
+        app.add_systems(Update, handle_cursor_fps);
+        for _ in 0..8 { app.update(); }
+        app.world_mut().resource_mut::<super::super::recoil::RecoilDelta>().0=Vec2::ZERO;
+        std::thread::sleep(Duration::from_millis(10));
+        app.update();
+        assert_vec2_near(app.world().resource::<CursorPosition>().0, Vec2::new(250.0, 251.0));
+        let events = collect_touch_events(&mut rx);
+        assert_eq!(events.last().unwrap().2, 500);
+        // Wire coordinates are truncated to integer pixels after float conversion.
+        assert!((501..=502).contains(&events.last().unwrap().3));
+        assert!(events.iter().all(|event| event.0 == MotionEventAction::Move));
+    }
+
+    #[test]
     fn fps_motion_preserves_subpixel_overlay_movement() {
         let (tx, mut rx) = broadcast::channel(16);
         send_fps_touch(
@@ -1231,7 +1342,7 @@ mod tests {
             Vec2::new(540.0, 500.0),
         );
         assert!(!config.touch_active);
-        restore_fps_touch(&tx, &mut config);
+        restore_fps_touch(&tx, &mut config, Vec2::splat(1000.0));
         let events = collect_touch_events(&mut rx);
         assert_eq!(events.len(), 2);
         assert!(matches!(events[0].0, MotionEventAction::Up));
@@ -1248,6 +1359,8 @@ mod tests {
             pointer_id: 0,
             active_pointer_id: 0,
             original_pos: Vec2::new(500.0, 500.0),
+            configured_pos: Vec2::new(500.0, 500.0),
+            start_random_offset: Vec2::ZERO,
             original_size: Vec2::new(1000.0, 1000.0),
             max_offset: Vec2::new(50.0, 0.0),
             touch_mode,

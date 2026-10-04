@@ -1,4 +1,4 @@
-use bevy::{prelude::*, window::WindowLevel};
+use bevy::{prelude::*, window::{WindowLevel, WindowMode}};
 use bevy_ineffable::prelude::IneffableCommands;
 use rust_i18n::t;
 
@@ -40,6 +40,7 @@ pub enum MaskCommand {
         script: String,
     },
     ToggleTitlebar,
+    RestoreWindow,
 }
 
 #[derive(Resource)]
@@ -81,6 +82,27 @@ pub fn handle_mask_command(
 ) {
     for (msg, oneshot_tx) in m_rx.0.try_iter() {
         match msg {
+            MaskCommand::RestoreWindow => {
+                if mapping_state.get() == &MappingState::Stop {
+                    let _ = oneshot_tx.send(Err("请先连接并控制设备".into()));
+                    continue;
+                }
+                let original: Vec2 = active_mapping.0.as_ref().map(|m| m.original_size.into())
+                    .unwrap_or(Vec2::new(16.0, 9.0));
+                let size = restored_content_size(original);
+                window.set_minimized(false);
+                window.set_maximized(false);
+                window.mode = WindowMode::Windowed;
+                window.visible = true;
+                titlebar_state.visible = true;
+                LocalConfig::set_titlebar_visible(true);
+                window.resolution.set(size.x, size.y + TITLEBAR_HEIGHT);
+                window.position.center(MonitorSelection::Primary);
+                mask_size.0 = size;
+                pending_focus.frames_remaining = 3;
+                log::info!("[Mask] Restored control window: {}x{}", size.x, size.y);
+                let _ = oneshot_tx.send(Ok("已恢复控制窗口到主屏幕中央".into()));
+            }
             MaskCommand::WinMove {
                 left,
                 top,
@@ -295,6 +317,25 @@ fn apply_titlebar_dimensions(
 
 pub fn physical_to_logical_i32(value: i32, scale_factor: f32) -> i32 {
     (value as f32 / scale_factor).round() as i32
+}
+
+fn restored_content_size(original: Vec2) -> Vec2 {
+    let original = if original.is_finite() && original.min_element() > 0.0 { original } else { Vec2::new(16.0, 9.0) };
+    original * (1000.0 / original.x).min(720.0 / original.y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn restore_window_size_fits_landscape_and_portrait_without_distortion() {
+        for original in [Vec2::new(3392.0, 2400.0), Vec2::new(1080.0, 2400.0)] {
+            let size = restored_content_size(original);
+            assert!(size.x <= 1000.0 && size.y <= 720.0);
+            assert!((size.x / size.y - original.x / original.y).abs() < 0.001);
+        }
+        assert!(restored_content_size(Vec2::ZERO).is_finite());
+    }
 }
 
 fn logical_to_physical_i32(value: f32, scale_factor: f32) -> i32 {

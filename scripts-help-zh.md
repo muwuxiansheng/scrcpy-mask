@@ -112,6 +112,11 @@ wait(1000); // 等待 1 秒
 * `x, y`: 相对坐标（相对于 `ORIGINAL_W` / `ORIGINAL_H`）
 * `action`: `"down"`, `"up"`, `"move"`, `"default"`（默认触发 down 后 30ms up）
 
+### `tap_random(pointer_id, x, y, offset_x, offset_y)`
+
+随机落点的短点击，例如 `tap_random(54, 1462, 2240, 10, 10)`。
+X/Y 分别在中心坐标 ±offset 范围内均匀取样，单位为手机原始坐标像素；偏移须为非负整数，0 表示该轴不偏移。落点限制在屏幕内，同一次点击的按下和 30ms 后抬起使用相同坐标。
+
 ### `swipe(pointer_id, interval, x1, y1, x2, y2, ...)`
 
 模拟滑动操作
@@ -135,16 +140,18 @@ wait(1000); // 等待 1 秒
 paste_text("Hello from script!");
 ```
 
-### `state_set(name, value)`
+### `state_set(name, value, scope?)`
 
 为当前 Script 映射保存一个共享状态值。
 
 * `name`: 状态名（非空字符串）
 * `value`: `Int`、`Bool` 或 `Str`
+* `scope`: 可选的映射 ID（非空字符串），省略时使用当前映射。用于跨映射同步，例如数字键钩子中 `state_set("next_item", 4, "fenghuo-wheel-cycle")`，让滚轮下次选择第4项。
 
-### `state_get(name, default_value)`
+### `state_get(name, default_value, scope?)`
 
 读取当前 Script 映射的共享状态值。如果值不存在，返回 `default_value`。
+可选 `scope` 可读取指定映射 ID 的状态；未指定时保持原有的独立状态行为。
 
 ### `state_has(name)`
 
@@ -166,9 +173,22 @@ paste_text("Hello from script!");
 
 * `id`: FPS 映射的 `id`
 
+### `recover_fps(id)`
+
+恢复控制状态，例如 `recover_fps("fenghuo-view")`。停止当前映射以释放移动、开火、自由视角、长按等触点，取消滚轮队列，关闭手机指针，释放脚本遗留触点，清空布局脚本状态，再进入指定FPS映射。旧脚本在下一次调用/触摸发送时取消。
+
+不发送游戏返回键，不自动关闭地图/背包界面。建议先手动关闭游戏界面后按恢复键。清空脚本状态也会使滚轮循环回到第1项。键位可创建为“脚本”，只在按下脚本填入此函数。
+
 ### `exit_fps()`
 
 退出 FPS 模式。
+
+### `enter_phone_pointer()` / `exit_phone_pointer()`（本地修改版）
+
+在 FPS 总开关开启时，明确进入手机指针模式或恢复 FPS 视角。
+进入后鼠标悬浮移动，左键按下、拖动、松开对应手机触摸；指针从屏幕中心呼出。
+重复进入或重复退出不会反向切换。退出时释放正在按住的指针触点。
+如果 FPS 尚未开启，先用 `enter_fps(id)` 开启。常用于背包、地图的开关脚本。
 
 ### `enter_raw_input()`
 

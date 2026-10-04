@@ -1,14 +1,17 @@
-use std::{collections::HashMap, time::Duration};
+use std::{collections::HashMap, sync::{Arc, atomic::{AtomicU64, Ordering}}, time::Duration};
 
 use crate::tokio_tasks::TokioTasksRuntime;
 use bevy::{
     ecs::{
         resource::Resource,
-        system::{Commands, Res, ResMut},
+        message::MessageReader,
+        system::{Commands, Res, ResMut, Single},
     },
     math::Vec2,
     state::state::State,
     time::{Time, Timer, TimerMode},
+    input::mouse::{MouseWheel, MouseScrollUnit},
+    window::Window,
 };
 use bevy_ineffable::prelude::{ContinuousBinding, Ineffable, InputBinding};
 use rust_i18n::t;
@@ -81,6 +84,7 @@ impl From<MappingScriptHooks> for BindMappingScriptHooks {
 
 pub fn script_init(mut commands: Commands) {
     commands.insert_resource(ActiveScriptMap::default());
+    commands.insert_resource(ScriptWheelState::default());
     let (runtime_command_tx, runtime_command_rx) =
         crossbeam_channel::unbounded::<ScriptRuntimeCommand>();
     commands.insert_resource(ScriptRuntimeCommandSender(runtime_command_tx));
@@ -88,8 +92,9 @@ pub fn script_init(mut commands: Commands) {
     commands.insert_resource(ScriptSharedState::default());
 }
 
-pub fn cleanup_script_on_stop(mut active_map: ResMut<ActiveScriptMap>) {
+pub fn cleanup_script_on_stop(mut active_map: ResMut<ActiveScriptMap>, mut wheel_state: ResMut<ScriptWheelState>) {
     active_map.0.clear();
+    wheel_state.cancel();
 }
 
 #[derive(Debug, Clone)]
@@ -179,7 +184,19 @@ pub fn handle_script(
     shared_state: Res<ScriptSharedState>,
     runtime: ResMut<TokioTasksRuntime>,
     mut active_map: ResMut<ActiveScriptMap>,
+    mut wheel_events: MessageReader<MouseWheel>,
+    mut wheel_state: ResMut<ScriptWheelState>,
+    window: Single<&Window>,
 ) {
+    let deltas: Vec<f32> = wheel_events.read().map(|e| {
+        match e.unit { MouseScrollUnit::Line => e.y, MouseScrollUnit::Pixel => e.y / 40.0 }
+    }).collect();
+    let (up_steps, down_steps) = if window.focused {
+        wheel_state.count_steps(&deltas)
+    } else {
+        wheel_state.cancel();
+        (0, 0)
+    };
     if let Some(active_mapping) = &active_mapping.0 {
         for (action, mapping) in &active_mapping.mappings {
             if action.as_ref().starts_with("Script") {
@@ -193,12 +210,48 @@ pub fn handle_script(
                 let fps_mode_flag = cursor_state.get() == &CursorState::Fps;
                 let interval = Duration::from_millis(mapping.interval as u64);
 
+                // Wheel pulses can remain active in consecutive frames or be merged in one frame.
+                // Read their full counts for simple press-only scripts rather than a hold edge.
+                let wheel_steps = if mapping.held_script_ast.empty && mapping.released_script_ast.empty {
+                    match mapping.bind.single_scroll_direction() {
+                        Some(true) => Some(up_steps),
+                        Some(false) => Some(down_steps),
+                        _ => None,
+                    }
+                } else { None };
+                if let Some(count) = wheel_steps {
+                    if count > 0 && !mapping.pressed_script_ast.empty {
+                        let ast = mapping.pressed_script_ast.clone();
+                        let shared_state = shared_state.as_ref().clone();
+                        let script_generation = shared_state.generation();
+                        let state_scope = mapping.id.clone();
+                        let serial = wheel_state.serial.entry(state_scope.clone()).or_default().clone();
+                        let generation = wheel_state.generation.clone();
+                        let version = generation.load(Ordering::Relaxed);
+                        runtime.spawn_background_task(move |_ctx| async move {
+                            let _guard = serial.lock().await;
+                            for _ in 0..count {
+                                if generation.load(Ordering::Relaxed) != version || shared_state.generation() != script_generation { break; }
+                                if let Err(e) = ast.run_script(&cs_tx, &script_command_tx,
+                                    &shared_state, &state_scope, original_size, cursor_pos, mask_size,
+                                    raw_input_flag, fps_mode_flag).await {
+                                    log::error!("[WheelScript] runtime error: {e}");
+                                    break;
+                                }
+                            }
+                        });
+                    }
+                    continue;
+                }
+
                 if ineffable.just_activated(action.ineff_continuous()) {
                     if !mapping.pressed_script_ast.empty {
                         let ast = mapping.pressed_script_ast.clone();
                         let shared_state = shared_state.as_ref().clone();
+                        let generation = shared_state.generation();
                         let state_scope = mapping.id.clone();
                         runtime.spawn_background_task(move |_ctx| async move {
+                            if shared_state.generation() != generation { return; }
                             if let Err(e) = ast
                                 .run_script(
                                     &cs_tx,
@@ -244,8 +297,10 @@ pub fn handle_script(
                         let ast = mapping.released_script_ast.clone();
                         let script_command_tx = script_command_tx.clone();
                         let shared_state = shared_state.as_ref().clone();
+                        let generation = shared_state.generation();
                         let state_scope = mapping.id.clone();
                         runtime.spawn_background_task(move |_ctx| async move {
+                            if shared_state.generation() != generation { return; }
                             if let Err(e) = ast
                                 .run_script(
                                     &cs_tx,
@@ -271,6 +326,47 @@ pub fn handle_script(
                 }
             }
         }
+    }
+}
+
+#[derive(Resource, Default)]
+pub struct ScriptWheelState {
+    up: f32,
+    down: f32,
+    serial: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    generation: Arc<AtomicU64>,
+}
+
+impl ScriptWheelState {
+    fn cancel(&mut self) {
+        self.up = 0.0;
+        self.down = 0.0;
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        self.serial.clear();
+    }
+    fn count_steps(&mut self, deltas: &[f32]) -> (usize, usize) {
+        for &delta in deltas {
+            if delta > 0.0 { self.up += delta; }
+            else { self.down -= delta; }
+        }
+        let counts = (self.up.floor() as usize, self.down.floor() as usize);
+        self.up -= counts.0 as f32;
+        self.down -= counts.1 as f32;
+        counts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn wheel_scripts_keep_merged_and_consecutive_scroll_steps() {
+        let mut state = ScriptWheelState::default();
+        assert_eq!(state.count_steps(&[1.0, 1.0, 3.0]), (5, 0));
+        assert_eq!(state.count_steps(&[1.0]), (1, 0));
+        assert_eq!(state.count_steps(&[-1.0, -2.0]), (0, 3));
+        assert_eq!(state.count_steps(&[0.25, 0.25]), (0, 0));
+        assert_eq!(state.count_steps(&[0.5]), (1, 0));
     }
 }
 
@@ -308,8 +404,10 @@ pub fn handle_script_trigger(
 
             let ast = timer.held_script_ast.clone();
             let shared_state = shared_state.as_ref().clone();
+            let generation = shared_state.generation();
             let state_scope = timer.state_scope.clone();
             runtime.spawn_background_task(move |_ctx| async move {
+                if shared_state.generation() != generation { return; }
                 if let Err(e) = ast
                     .run_script(
                         &cs_tx,

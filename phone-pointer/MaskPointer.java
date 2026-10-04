@@ -48,6 +48,9 @@ public final class MaskPointer {
         call(canvas, "drawPath", new Class<?>[]{pathClass,paintClass}, path,paint);
         call(surface, "unlockCanvasAndPost", new Class<?>[]{Class.forName("android.graphics.Canvas")}, canvas);
         Object tx = transaction();
+        // This shell-owned, display-only cursor must not block injected touches
+        // beneath its buffer. Otherwise Android rejects them as untrusted overlays.
+        call(tx, "setTrustedOverlay", new Class<?>[]{layerClass,boolean.class}, layer,true);
         call(tx, "setLayer", new Class<?>[]{layerClass,int.class}, layer,Integer.MAX_VALUE-10);
         call(tx, "setLayerStack", new Class<?>[]{layerClass,int.class}, layer,0);
         finish(tx);

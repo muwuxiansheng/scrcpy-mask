@@ -62,6 +62,8 @@ pub struct BindMappingFps {
     pub sensitivity_y: f32,
     pub max_offset_x: f32,
     pub max_offset_y: f32,
+    pub start_random_offset_x: f32,
+    pub start_random_offset_y: f32,
     pub touch_mode: FpsTouchMode,
     pub bind: ButtonBinding,
     pub input_binding: InputBinding,
@@ -78,6 +80,8 @@ impl From<MappingFps> for BindMappingFps {
             sensitivity_y: value.sensitivity_y,
             max_offset_x: value.max_offset_x,
             max_offset_y: value.max_offset_y,
+            start_random_offset_x: value.start_random_offset_x,
+            start_random_offset_y: value.start_random_offset_y,
             touch_mode: value.touch_mode,
             bind: value.bind.clone(),
             input_binding: PulseBinding::just_pressed(value.bind).0,
@@ -107,6 +111,10 @@ pub struct MappingFps {
     )]
     pub max_offset_y: f32,
     #[serde(default)]
+    pub start_random_offset_x: f32,
+    #[serde(default)]
+    pub start_random_offset_y: f32,
+    #[serde(default)]
     pub touch_mode: FpsTouchMode,
     pub bind: ButtonBinding,
 }
@@ -117,24 +125,28 @@ pub fn enter_fps_mode(
     next_state: &mut NextState<CursorState>,
     mapping: &BindMappingFps,
     original_size: Vec2,
+    mask_size: Vec2,
 ) {
     let original_pos = mapping.position.into();
     fps_config.pointer_id = mapping.pointer_id;
     fps_config.reset_touch_state();
     fps_config.original_pos = original_pos;
+    fps_config.configured_pos = original_pos;
+    fps_config.start_random_offset = Vec2::new(mapping.start_random_offset_x, mapping.start_random_offset_y);
     fps_config.original_size = original_size;
     fps_config.ignore_fps_motion = false;
     fps_config.sensitivity = (mapping.sensitivity_x, mapping.sensitivity_y).into();
     fps_config.max_offset = Vec2::new(mapping.max_offset_x, mapping.max_offset_y);
     fps_config.touch_mode = mapping.touch_mode;
     fps_config.touch_active = true;
+    super::cursor::randomize_fps_start(fps_config, mask_size);
 
     ControlMsgHelper::send_touch(
         cs_tx,
         MotionEventAction::Down,
         mapping.pointer_id,
         original_size,
-        original_pos,
+        fps_config.original_pos,
     );
     next_state.set(CursorState::Fps);
 }
@@ -158,6 +170,10 @@ pub fn exit_fps_mode(
 
 impl ValidateMappingConfig for MappingFps {
     fn validate(&self) -> Result<(), String> {
+        if !self.start_random_offset_x.is_finite() || !self.start_random_offset_y.is_finite()
+            || self.start_random_offset_x < 0.0 || self.start_random_offset_y < 0.0 {
+            return Err("FPS start random ranges must be finite and non-negative".to_string());
+        }
         if self.position.x <= FPS_MARGIN as i32 || self.position.y <= FPS_MARGIN as i32 {
             return Err(t!(
                 "mask.mapping.invalidPosition",
@@ -210,6 +226,7 @@ pub fn handle_fps(
                                 &mut next_state,
                                 mapping,
                                 original_size,
+                                mask_size.0,
                             );
                         }
                         CursorState::Fps => {
@@ -313,6 +330,13 @@ impl ValidateMappingConfig for MappingFire {
 
 #[derive(Resource, Default)]
 pub struct ActiveFireMap(HashMap<String, FireItem>);
+
+impl ActiveFireMap {
+    pub fn is_firing_for_recoil(&self, input: &Ineffable, config: &super::config::BindMappingConfig) -> bool {
+        config.mappings.iter().any(|(action,mapping)|matches!(mapping,super::config::BindMappingType::Fire(_))
+            && self.0.contains_key(action.as_ref()) && input.is_active(action.ineff_continuous()))
+    }
+}
 
 #[derive(Resource, Default)]
 pub struct FireLifecycleState(MappingLifecycleState<FireReleaseContext>);
@@ -529,7 +553,7 @@ fn release_fire_item(
         return None;
     }
 
-    restore_fps_touch(cs_tx, fps_config);
+    restore_fps_touch(cs_tx, fps_config, mask_size);
     fps_config.ignore_fps_motion = false;
     Some(fps_config.original_pos / fps_config.original_size * mask_size)
 }

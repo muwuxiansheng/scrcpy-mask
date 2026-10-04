@@ -52,6 +52,7 @@ export interface LocalConfigState {
   // mask area
   alwaysOnTop: boolean;
   titlebarVisible: boolean;
+  vsync: boolean;
   verticalMaskHeight: number;
   horizontalMaskWidth: number;
   verticalPosition: [number, number];
@@ -93,6 +94,7 @@ const initialState: LocalConfigState = {
   adbConnectAddress: "",
   alwaysOnTop: true,
   titlebarVisible: true,
+  vsync: false,
   verticalMaskHeight: 0,
   horizontalMaskWidth: 0,
   verticalPosition: [0, 0],
@@ -155,6 +157,10 @@ const localConfigSlice = createSlice({
     setAlwaysOnTop: (state, action: PayloadAction<boolean>) => {
       state.alwaysOnTop = action.payload;
       updateLocalConfig("always_on_top", action.payload);
+    },
+    setVsync: (state, action: PayloadAction<boolean>) => {
+      state.vsync = action.payload;
+      updateLocalConfig("vsync", action.payload, 0);
     },
     setTitlebarVisible: (state, action: PayloadAction<boolean>) => {
       state.titlebarVisible = action.payload;
@@ -277,6 +283,7 @@ export const {
   setAdbConnectAddress,
   setAlwaysOnTop,
   setTitlebarVisible,
+  setVsync,
   setverticalMaskHeight,
   sethorizontalMaskWidth,
   setVerticalPosition,

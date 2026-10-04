@@ -282,6 +282,13 @@ impl<'de> Deserialize<'de> for MergedButton {
 pub struct ButtonBinding(Vec<MergedButton>);
 
 impl ButtonBinding {
+    pub fn single_scroll_direction(&self) -> Option<bool> {
+        match self.0.as_slice() {
+            [MergedButton::ScrollUp] => Some(true),
+            [MergedButton::ScrollDown] => Some(false),
+            _ => None,
+        }
+    }
     pub fn has_mouse_binding(&self) -> bool {
         self.0.iter().any(|button| {
             matches!(

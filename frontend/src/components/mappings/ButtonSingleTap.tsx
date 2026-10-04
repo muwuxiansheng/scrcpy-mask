@@ -196,6 +196,24 @@ function Setting({
           note={config.note}
           onNoteChange={(note) => onConfigChange({ ...config, note })}
         />
+        <ItemBox label="长按微动" tooltip="开启按键同步后，按住超过250ms才开始模拟手指轻微晃动；短点击不受影响。">
+          <Switch checked={config.hold_jitter_enabled} disabled={!config.sync}
+            onChange={(v) => onConfigChange({ ...config, hold_jitter_enabled: v })} />
+        </ItemBox>
+        {config.hold_jitter_enabled && config.sync && <>
+          <ItemBox label="微动 X 范围" tooltip="围绕本次随机落点的左右偏移，单位为手机像素。">
+            <InputNumber className="w-full" min={0} value={config.hold_jitter_x}
+              onChange={(v) => v !== null && onConfigChange({ ...config, hold_jitter_x: v })} />
+          </ItemBox>
+          <ItemBox label="微动 Y 范围" tooltip="围绕本次随机落点的上下偏移，单位为手机像素。">
+            <InputNumber className="w-full" min={0} value={config.hold_jitter_y}
+              onChange={(v) => v !== null && onConfigChange({ ...config, hold_jitter_y: v })} />
+          </ItemBox>
+          <ItemBox label="微动周期（毫秒）" tooltip="缓慢移向下一个随机位置的时间，越大越慢。建议160～300ms。">
+            <InputNumber className="w-full" min={50} max={5000} precision={0} value={config.hold_jitter_interval_ms}
+              onChange={(v) => v !== null && onConfigChange({ ...config, hold_jitter_interval_ms: v })} />
+          </ItemBox>
+        </>}
         <SettingScriptHooks
           scriptHooks={config.script_hooks}
           onScriptHooksChange={(script_hooks) =>

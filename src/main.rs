@@ -82,7 +82,9 @@ fn main() {
                     has_shadow: false,
                     transparent: true, // for windows: https://github.com/bevyengine/bevy/issues/7544
                     decorations: false,
-                    present_mode: PresentMode::AutoVsync,
+                    // Input updates share the window loop; do not cap mouse view control
+                    // to the desktop monitor's refresh rate, including transparent mode.
+                    present_mode: if local_config.vsync { PresentMode::AutoVsync } else { PresentMode::AutoNoVsync },
                     resizable: true,
                     visible: false,
                     focused: false,

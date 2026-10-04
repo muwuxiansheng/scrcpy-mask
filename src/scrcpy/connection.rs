@@ -136,12 +136,16 @@ impl ScrcpyConnection {
                                     }
                                     _ => {}
                                 };
+                                let diagnostic = crate::mask::mapping::fps_diagnostics::packet(&msg);
                                 let data:Vec<u8> = msg.into();
                                 if let Err(e) = write_half.write_all(&data).await {
                                     log::error!("[Controller] {}: {}", t!("scrcpy.controlConnWriteFailed"),e);
+                                } else if let Some((id, action)) = diagnostic {
+                                    crate::mask::mapping::fps_diagnostics::wire_written(id, action);
                                 }
                         }
                         Err(RecvError::Lagged(skipped)) => {
+                            crate::mask::mapping::fps_diagnostics::lagged(skipped);
                             log::warn!("[Controller] {}",t!("controller.csReceiverLagged", skipped => skipped));
                         }
                         Err(e) => {

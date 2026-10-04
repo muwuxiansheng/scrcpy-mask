@@ -50,21 +50,13 @@ pub fn cleanup_tap_on_stop(
 ) {
     if let Some(active_mapping) = &active_mapping.0 {
         let original_size: Vec2 = active_mapping.original_size.into();
-        for (released_action, random_pos) in active_single_tap.0.drain() {
-            let Some((_, mapping)) = active_mapping
-                .mappings
-                .iter()
-                .find(|(action, _)| action.as_ref() == released_action)
-            else {
-                continue;
-            };
-            let mapping = mapping.as_ref_singletap();
+        for (_, touch) in active_single_tap.0.drain() {
             ControlMsgHelper::send_touch(
                 &cs_tx_res.0,
                 MotionEventAction::Up,
-                mapping.pointer_id,
+                touch.pointer_id,
                 original_size,
-                random_pos,
+                touch.position,
             );
         }
     } else {
@@ -88,6 +80,10 @@ pub struct BindMappingSingleTap {
     pub input_binding: InputBinding,
     pub random_offset_x: f32,
     pub random_offset_y: f32,
+    pub hold_jitter_enabled: bool,
+    pub hold_jitter_x: f32,
+    pub hold_jitter_y: f32,
+    pub hold_jitter_interval_ms: u64,
     pub script_hooks: BindMappingScriptHooks,
 }
 
@@ -103,6 +99,10 @@ impl From<MappingSingleTap> for BindMappingSingleTap {
             bind: value.bind.clone(),
             random_offset_x: value.random_offset_x,
             random_offset_y: value.random_offset_y,
+            hold_jitter_enabled: value.hold_jitter_enabled,
+            hold_jitter_x: value.hold_jitter_x,
+            hold_jitter_y: value.hold_jitter_y,
+            hold_jitter_interval_ms: value.hold_jitter_interval_ms,
             script_hooks: value.script_hooks.into(),
             input_binding: ContinuousBinding::hold(value.bind).0,
         }
@@ -130,17 +130,133 @@ pub struct MappingSingleTap {
     )]
     pub random_offset_y: f32,
     #[serde(default)]
+    pub hold_jitter_enabled: bool,
+    #[serde(default = "default_hold_jitter")]
+    pub hold_jitter_x: f32,
+    #[serde(default = "default_hold_jitter")]
+    pub hold_jitter_y: f32,
+    #[serde(default = "default_hold_jitter_interval")]
+    pub hold_jitter_interval_ms: u64,
+    #[serde(default)]
     pub script_hooks: MappingScriptHooks,
 }
 
 impl ValidateMappingConfig for MappingSingleTap {
     fn validate(&self) -> Result<(), String> {
+        self.validate_hold_jitter()?;
         self.script_hooks.validate()
     }
 }
 
 #[derive(Resource, Default)]
-pub struct ActiveSingleTapMap(HashMap<String, Vec2>);
+pub struct ActiveSingleTapMap(HashMap<String, HeldTapTouch>);
+
+fn default_hold_jitter() -> f32 { 2.0 }
+fn default_hold_jitter_interval() -> u64 { 160 }
+
+#[cfg(test)]
+mod hold_jitter_tests {
+    use super::*;
+
+    #[test]
+    fn hold_jitter_is_delayed_bounded_and_releases_at_last_move() {
+        let mut touch = HeldTapTouch::new(Vec2::new(100.0, 100.0), 3);
+        let range = Vec2::splat(2.0);
+        for _ in 0..15 {
+            assert!(touch.advance(0.016, range, 0.16, Vec2::splat(200.0)).is_none());
+        }
+        assert_eq!(touch.position, touch.anchor);
+        let mut moves = 0;
+        for _ in 0..600 {
+            if let Some(pos) = touch.advance(0.016, range, 0.16, Vec2::splat(200.0)) {
+                moves += 1;
+                assert!((pos - touch.anchor).abs().max_element() <= 2.001);
+            }
+        }
+        assert!(moves > 0);
+        let last = touch.position;
+        let mapping: MappingSingleTap = serde_json::from_value(serde_json::json!({
+            "id":"test", "position":{"x":100,"y":100}, "note":"", "pointer_id":3,
+            "duration":50, "sync":true, "bind":["KeyF"]
+        })).unwrap();
+        assert!(!mapping.hold_jitter_enabled);
+        let mapping = mapping.into();
+        let (tx, mut rx) = tokio::sync::broadcast::channel(8);
+        let mut active = ActiveSingleTapMap::default();
+        active.0.insert("test".into(), touch);
+        assert!(apply_single_tap_up(&ChannelSenderCS(tx), &mut active, "test", &mapping, Vec2::splat(200.0)));
+        match rx.try_recv().unwrap() {
+            crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent {action,x,y,..} => {
+                assert_eq!(action, MotionEventAction::Up);
+                assert_eq!((x,y), (last.x as i32,last.y as i32));
+            }
+            _ => panic!("Expected touch up"),
+        }
+        assert!(active.0.is_empty());
+    }
+
+    #[test]
+    fn zero_hold_jitter_never_moves_even_during_long_hold() {
+        let mut touch = HeldTapTouch::new(Vec2::splat(100.0), 3);
+        for _ in 0..100 { assert!(touch.advance(0.1, Vec2::ZERO, 0.16, Vec2::splat(200.0)).is_none()); }
+        assert_eq!(touch.position, touch.anchor);
+    }
+}
+
+impl MappingSingleTap {
+    pub fn validate_hold_jitter(&self) -> Result<(), String> {
+        if !self.hold_jitter_x.is_finite() || !self.hold_jitter_y.is_finite()
+            || self.hold_jitter_x < 0.0 || self.hold_jitter_y < 0.0 {
+            return Err("长按微动 X/Y 范围必须是非负有限数值".into());
+        }
+        if self.hold_jitter_interval_ms < 50 || self.hold_jitter_interval_ms > 5000 {
+            return Err("长按微动周期必须在 50～5000ms 之间".into());
+        }
+        Ok(())
+    }
+}
+
+struct HeldTapTouch {
+    position: Vec2,
+    anchor: Vec2,
+    from: Vec2,
+    target: Vec2,
+    elapsed: f32,
+    phase: f32,
+    send_elapsed: f32,
+    started: bool,
+    pointer_id: u64,
+}
+
+impl HeldTapTouch {
+    fn new(position: Vec2, pointer_id: u64) -> Self {
+        Self { position, anchor: position, from: position, target: position,
+            elapsed: 0.0, phase: 0.0, send_elapsed: 0.0, started: false, pointer_id }
+    }
+
+    fn advance(&mut self, dt: f32, range: Vec2, period: f32, screen: Vec2) -> Option<Vec2> {
+        let before = self.elapsed;
+        self.elapsed += dt;
+        // Short taps keep their original touch location; movement begins after 250ms.
+        if self.elapsed <= 0.25 || range == Vec2::ZERO { return None; }
+        let active_dt = self.elapsed - before.max(0.25);
+        if !self.started || self.phase >= period {
+            self.from = self.position;
+            self.target = random_offset_vec2(self.anchor, range).clamp(Vec2::ZERO, screen - Vec2::ONE);
+            self.phase = 0.0;
+            self.started = true;
+        }
+        self.phase += active_dt;
+        self.send_elapsed += active_dt;
+        if self.send_elapsed < 0.016 { return None; }
+        self.send_elapsed %= 0.016;
+        let t = (self.phase / period).clamp(0.0, 1.0);
+        let next = self.from.lerp(self.target, t * t * (3.0 - 2.0 * t));
+        if next.as_ivec2() == self.position.as_ivec2() { return None; }
+        self.position = next;
+        Some(next)
+    }
+}
 
 #[derive(Resource, Default)]
 pub struct SingleTapLifecycleState(MappingLifecycleState<SingleTapReleaseContext>);
@@ -179,7 +295,7 @@ fn apply_single_tap_down(
         original_size,
         random_pos,
     );
-    active_single_tap.0.insert(action, random_pos);
+    active_single_tap.0.insert(action, HeldTapTouch::new(random_pos, mapping.pointer_id));
 }
 
 fn apply_single_tap_up(
@@ -189,13 +305,13 @@ fn apply_single_tap_up(
     mapping: &BindMappingSingleTap,
     original_size: Vec2,
 ) -> bool {
-    if let Some(random_pos) = active_single_tap.0.remove(action) {
+    if let Some(touch) = active_single_tap.0.remove(action) {
         ControlMsgHelper::send_touch(
             &cs_tx.0,
             MotionEventAction::Up,
             mapping.pointer_id,
             original_size,
-            random_pos,
+            touch.position,
         );
         true
     } else {
@@ -217,6 +333,7 @@ pub fn handle_single_tap(
     cursor_state: Res<State<CursorState>>,
     runtime: ResMut<TokioTasksRuntime>,
     mut lifecycle_state: ResMut<SingleTapLifecycleState>,
+    time: Res<Time>,
 ) {
     if let Some(active_mapping) = &active_mapping.0 {
         for (action, mapping) in &active_mapping.mappings {
@@ -350,8 +467,10 @@ pub fn handle_single_tap(
                             mapping_state.get() == &MappingState::RawInput,
                             cursor_state.get() == &CursorState::Fps,
                         );
+                        let generation = exec_ctx.shared_state.generation();
                         runtime.spawn_background_task(move |_ctx| async move {
                             let result = run_with_hooks(hooks, exec_ctx, move |ctx| async move {
+                                if ctx.shared_state.generation() != generation { return Ok::<(), MappingExecutionError>(()); }
                                 ControlMsgHelper::send_touch(
                                     &ctx.cs_tx,
                                     MotionEventAction::Down,
@@ -360,6 +479,7 @@ pub fn handle_single_tap(
                                     random_pos,
                                 );
                                 sleep(duration).await;
+                                if ctx.shared_state.generation() != generation { return Ok::<(), MappingExecutionError>(()); }
                                 ControlMsgHelper::send_touch(
                                     &ctx.cs_tx,
                                     MotionEventAction::Up,
@@ -416,6 +536,16 @@ pub fn handle_single_tap(
                                 log::error!("[SingleTap] script hook runtime error: {:?}", e);
                             }
                         });
+                    }
+                }
+                if mapping.sync && mapping.hold_jitter_enabled {
+                    if let Some(touch) = active_single_tap.0.get_mut(action.as_ref()) {
+                        if let Some(position) = touch.advance(time.delta_secs(),
+                            Vec2::new(mapping.hold_jitter_x, mapping.hold_jitter_y),
+                            mapping.hold_jitter_interval_ms as f32 / 1000.0, original_size) {
+                            ControlMsgHelper::send_touch(&cs_tx_res.0, MotionEventAction::Move,
+                                mapping.pointer_id, original_size, position);
+                        }
                     }
                 }
             }

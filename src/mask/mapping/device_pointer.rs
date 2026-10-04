@@ -19,7 +19,7 @@ use std::{
     collections::VecDeque,
     io::{BufRead, BufReader, Write},
     net::{SocketAddr, TcpStream},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 const TOUCH_ID: u64 = 0x7fff_fffe;
@@ -80,7 +80,6 @@ pub struct DevicePointer {
     position: Vec2,
     size: Vec2,
     clicking: bool,
-    click_started: Option<Instant>,
     touch_position: Vec2,
     button_events: VecDeque<(ButtonState, Vec2)>,
     connection: Option<BufReader<TcpStream>>,
@@ -136,10 +135,9 @@ impl DevicePointer {
             );
             self.clicking = false;
         }
-        self.click_started = None;
         self.button_events.clear();
     }
-    fn stop(&mut self, sender: &ChannelSenderCS) {
+    pub(super) fn stop(&mut self, sender: &ChannelSenderCS) {
         self.release_click(sender);
         if self.connection.is_some() {
             let _ = self.command("HIDE\n");
@@ -170,25 +168,44 @@ pub(super) fn toggle_pointer(
     sender: Res<ChannelSenderCS>,
     mut ignore: ResMut<IgnoreFirstMotion>,
 ) {
-    if pointer.active {
-        pointer.stop(&sender);
+    let enable = !pointer.active;
+    let start = requested_start(&ineffable, &mappings).unwrap_or(Vec2::splat(0.5));
+    if let Err(error) = set_pointer_mode(enable, start, &mut pointer, &mut fps, &mut position, mask.0, &sender, &mut ignore) {
+        log::error!("[DevicePointer] cannot show phone pointer: {error}");
+    }
+}
+
+pub(super) fn set_pointer_mode(
+    enable: bool,
+    start: Vec2,
+    pointer: &mut DevicePointer,
+    fps: &mut ActiveCursorFpsConfig,
+    position: &mut CursorPosition,
+    mask: Vec2,
+    sender: &ChannelSenderCS,
+    ignore: &mut IgnoreFirstMotion,
+) -> Result<(), String> {
+    if pointer.active == enable { return Ok(()); }
+    if !enable {
+        pointer.stop(sender);
         fps.ignore_fps_motion = false;
-        restore_fps_touch(&sender.0, &mut fps);
-        position.0 = fps.original_pos / fps.original_size * mask.0;
+        restore_fps_touch(&sender.0, fps, mask);
+        position.0 = fps.original_pos / fps.original_size * mask;
         log::info!("[DevicePointer] returned to FPS view");
     } else {
-        release_fps_touches(&sender.0, &mut fps, mask.0, position.0);
-        let Some(start) = requested_start(&ineffable, &mappings) else { return; };
+        release_fps_touches(&sender.0, fps, mask, position.0);
         if let Err(error) = pointer.start(start) {
-            pointer.stop(&sender);
-            restore_fps_touch(&sender.0, &mut fps);
-            position.0 = fps.original_pos / fps.original_size * mask.0;
-            log::error!("[DevicePointer] cannot show phone pointer: {error}");
+            pointer.stop(sender);
+            restore_fps_touch(&sender.0, fps, mask);
+            position.0 = fps.original_pos / fps.original_size * mask;
+            ignore.0 = true;
+            return Err(error.to_string());
         } else {
             log::info!("[DevicePointer] phone pointer enabled; left button uses touch");
         }
     }
     ignore.0 = true;
+    Ok(())
 }
 
 pub(super) fn handle_pointer_motion(
@@ -206,6 +223,7 @@ pub(super) fn handle_pointer_motion(
     let events: Vec<_> = button_input.read().filter(|e| e.button == MouseButton::Left).map(|e| e.state).collect();
     if !pointer.active { return; }
     if !window.focused {
+        if pointer.clicking { log::info!("[DevicePointer] focus lost: releasing held touch"); }
         pointer.release_click(&sender);
         return;
     }
@@ -218,7 +236,7 @@ pub(super) fn handle_pointer_motion(
         if let Err(error) = pointer.show() {
             log::error!("[DevicePointer] service connection lost: {error}");
             pointer.stop(&sender);
-            restore_fps_touch(&sender.0, &mut fps);
+            restore_fps_touch(&sender.0, &mut fps, mask.0);
             fps_position.0 = fps.original_pos / fps.original_size * mask.0;
             return;
         }
@@ -229,29 +247,26 @@ pub(super) fn handle_pointer_motion(
         if mouse.just_pressed(MouseButton::Left) {
             pointer.button_events.push_back((ButtonState::Pressed, pos));
         }
-        if mouse.just_released(MouseButton::Left) || (pointer.clicking && !mouse.pressed(MouseButton::Left) && pointer.button_events.is_empty()) {
+        if mouse.just_released(MouseButton::Left) {
             pointer.button_events.push_back((ButtonState::Released, pos));
         }
     } else {
         for state in events { pointer.button_events.push_back((state, pos)); }
     }
     while let Some(&(state, event_pos)) = pointer.button_events.front() {
-        if state == ButtonState::Released && pointer.clicking && pointer.click_started.is_some_and(|t| t.elapsed() < Duration::from_millis(50)) {
-            break;
-        }
         pointer.button_events.pop_front();
         match state {
             ButtonState::Pressed if !pointer.clicking => {
                 pointer.clicking = true;
-                pointer.click_started = Some(Instant::now());
                 pointer.touch_position = event_pos;
                 ControlMsgHelper::send_touch(&sender.0, MotionEventAction::Down, TOUCH_ID, pointer.size, event_pos);
+                log::info!("[DevicePointer] touch DOWN at ({}, {})", event_pos.x as i32, event_pos.y as i32);
             }
             ButtonState::Released if pointer.clicking => {
                 pointer.clicking = false;
-                pointer.click_started = None;
                 pointer.touch_position = event_pos;
                 ControlMsgHelper::send_touch(&sender.0, MotionEventAction::Up, TOUCH_ID, pointer.size, event_pos);
+                log::info!("[DevicePointer] touch UP at ({}, {})", event_pos.x as i32, event_pos.y as i32);
             }
             _ => {}
         }
@@ -289,6 +304,33 @@ mod tests {
     #[test]
     fn configured_pointer_start_is_clamped_inside_phone_screen() {
         assert_eq!(phone_start_position(Vec2::new(1.2, -0.2), Vec2::new(3392.0, 2400.0)), Vec2::new(3391.0, 0.0));
+    }
+    #[test]
+    fn scripted_pointer_close_releases_click_restores_view_and_is_idempotent() {
+        let (tx, mut rx) = broadcast::channel(16);
+        let sender = ChannelSenderCS(tx);
+        let mut pointer = DevicePointer {
+            active: true, clicking: true, size: Vec2::splat(1000.0),
+            touch_position: Vec2::new(100.0, 200.0), ..default()
+        };
+        let mut fps = ActiveCursorFpsConfig::default();
+        fps.pointer_id = 7;
+        fps.original_size = Vec2::splat(1000.0);
+        fps.original_pos = Vec2::splat(500.0);
+        let mut position = CursorPosition(Vec2::ZERO);
+        let mut ignore = IgnoreFirstMotion(false);
+        for _ in 0..2 {
+            set_pointer_mode(false, Vec2::splat(0.5), &mut pointer, &mut fps,
+                &mut position, Vec2::splat(1000.0), &sender, &mut ignore).unwrap();
+        }
+        assert!(!pointer.active && !pointer.clicking);
+        assert!(fps.touch_active && ignore.0);
+        assert_eq!(position.0, Vec2::splat(500.0));
+        let mut touches = Vec::new();
+        while let Ok(crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action, pointer_id, .. }) = rx.try_recv() {
+            touches.push((action, pointer_id));
+        }
+        assert_eq!(touches, vec![(MotionEventAction::Up, TOUCH_ID), (MotionEventAction::Down, 7)]);
     }
     fn test_app() -> (
         App,
@@ -390,7 +432,6 @@ mod tests {
         app.world_mut()
             .resource_mut::<ButtonInput<MouseButton>>()
             .release(MouseButton::Left);
-        app.world_mut().resource_mut::<DevicePointer>().click_started = Some(Instant::now() - Duration::from_millis(60));
         app.update();
         assert!(matches!(
             rx.try_recv().unwrap(),
@@ -451,16 +492,13 @@ mod tests {
         assert!(matches!(rx.try_recv().unwrap(), crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action: MotionEventAction::Down, x: 123, y: 456, .. }));
     }
     #[test]
-    fn rapid_click_preserves_down_and_delays_up_even_without_mouse_motion() {
+    fn rapid_click_preserves_down_and_up_even_without_mouse_motion() {
         let (mut app, mut rx) = test_app();
         queue_left(&mut app, ButtonState::Pressed);
         queue_left(&mut app, ButtonState::Released);
         app.add_systems(Update, handle_pointer_motion);
         app.update();
         assert!(matches!(rx.try_recv().unwrap(), crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action: MotionEventAction::Down, .. }));
-        assert!(rx.try_recv().is_err());
-        app.world_mut().resource_mut::<DevicePointer>().click_started = Some(Instant::now() - Duration::from_millis(60));
-        app.update();
         assert!(matches!(rx.try_recv().unwrap(), crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action: MotionEventAction::Up, .. }));
         assert!(!app.world().resource::<DevicePointer>().clicking);
     }
@@ -474,11 +512,45 @@ mod tests {
         app.add_systems(Update, handle_pointer_motion);
         app.update();
         assert!(matches!(rx.try_recv().unwrap(), crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action: MotionEventAction::Down, .. }));
-        app.world_mut().resource_mut::<DevicePointer>().click_started = Some(Instant::now() - Duration::from_millis(60));
-        app.update();
         assert!(matches!(rx.try_recv().unwrap(), crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action: MotionEventAction::Up, .. }));
         assert!(matches!(rx.try_recv().unwrap(), crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action: MotionEventAction::Down, .. }));
-        app.world_mut().resource_mut::<DevicePointer>().click_started = Some(Instant::now() - Duration::from_millis(60));
+        assert!(matches!(rx.try_recv().unwrap(), crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action: MotionEventAction::Up, .. }));
+    }
+    #[test]
+    fn held_touch_survives_idle_and_drags_down_then_up_without_release() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let socket = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut reader = BufReader::new(stream);
+            let mut commands = Vec::new();
+            for _ in 0..2 {
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                reader.get_mut().write_all(b"OK\n").unwrap();
+                commands.push(line);
+            }
+            commands
+        });
+        let (mut app, mut rx) = test_app();
+        app.world_mut().resource_mut::<DevicePointer>().connection = Some(BufReader::new(socket));
+        app.add_systems(Update, handle_pointer_motion);
+        queue_left(&mut app, ButtonState::Pressed);
+        app.update();
+        assert!(matches!(rx.try_recv().unwrap(), crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action: MotionEventAction::Down, .. }));
+        app.update();
+        assert!(rx.try_recv().is_err());
+        for (delta_y, expected_y) in [(50.0, 556), (-50.0, 456)] {
+            app.world_mut().resource_mut::<AccumulatedMouseMotion>().delta = Vec2::new(0.0, delta_y);
+            app.update();
+            assert!(matches!(rx.try_recv().unwrap(), crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action: MotionEventAction::Move, y, .. } if y == expected_y));
+            assert!(rx.try_recv().is_err());
+            assert!(app.world().resource::<DevicePointer>().clicking);
+        }
+        assert_eq!(server.join().unwrap(), vec!["SHOW 123 556\n", "SHOW 123 456\n"]);
+        app.world_mut().resource_mut::<AccumulatedMouseMotion>().delta = Vec2::ZERO;
+        queue_left(&mut app, ButtonState::Released);
         app.update();
         assert!(matches!(rx.try_recv().unwrap(), crate::scrcpy::control_msg::ScrcpyControlMsg::InjectTouchEvent { action: MotionEventAction::Up, .. }));
     }

@@ -68,6 +68,10 @@ export interface SingleTapConfig {
   position: Position;
   random_offset_x: number;
   random_offset_y: number;
+  hold_jitter_enabled: boolean;
+  hold_jitter_x: number;
+  hold_jitter_y: number;
+  hold_jitter_interval_ms: number;
   script_hooks: MappingScriptHooks;
   sync: boolean;
   type: "SingleTap";
@@ -83,6 +87,10 @@ export function newSingleTap(position: Position): SingleTapConfig {
     position,
     random_offset_x: default_random_offset,
     random_offset_y: default_random_offset,
+    hold_jitter_enabled: false,
+    hold_jitter_x: 2,
+    hold_jitter_y: 2,
+    hold_jitter_interval_ms: 160,
     script_hooks: defaultScriptHooks(),
     sync: false,
     type: "SingleTap",
@@ -408,6 +416,8 @@ export interface FpsConfig {
   sensitivity_y: number;
   max_offset_x: number;
   max_offset_y: number;
+  start_random_offset_x: number;
+  start_random_offset_y: number;
   touch_mode: FpsTouchMode;
   type: "Fps";
 }
@@ -433,6 +443,8 @@ export function newFps(position: Position): FpsConfig {
     sensitivity_y: 0.8,
     max_offset_x: 0,
     max_offset_y: 0,
+    start_random_offset_x: 0,
+    start_random_offset_y: 0,
     touch_mode: { type: "single", interval: 0 },
     type: "Fps",
   };
@@ -585,6 +597,10 @@ export function normalizeMappingConfig(config: MappingConfig): MappingConfig {
             id,
             random_offset_x: withDefaultRandomOffset(mapping.random_offset_x),
             random_offset_y: withDefaultRandomOffset(mapping.random_offset_y),
+            hold_jitter_enabled: mapping.hold_jitter_enabled ?? false,
+            hold_jitter_x: mapping.hold_jitter_x ?? 2,
+            hold_jitter_y: mapping.hold_jitter_y ?? 2,
+            hold_jitter_interval_ms: mapping.hold_jitter_interval_ms ?? 160,
             script_hooks: withDefaultScriptHooks(mapping.script_hooks),
           };
         case "RepeatTap":

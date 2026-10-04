@@ -146,6 +146,20 @@ impl<ReleaseContext> Default for MappingLifecycleState<ReleaseContext> {
     }
 }
 
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn recovery_cleanup_invalidates_delayed_before_hooks() {
+        let mut lifecycle = MappingLifecycleState::<()>::default();
+        let old = lifecycle.begin_start("held");
+        lifecycle.clear_all();
+        assert!(matches!(lifecycle.finish_start("held", old), MappingLifecycleStart::Stale));
+        let new = lifecycle.begin_start("held");
+        assert!(matches!(lifecycle.finish_start("held", new), MappingLifecycleStart::Ready { .. }));
+    }
+}
+
 impl<ReleaseContext> MappingLifecycleState<ReleaseContext> {
     pub fn begin_start(&mut self, action: &str) -> u64 {
         let version = self.versions.entry(action.to_string()).or_default();
@@ -168,7 +182,7 @@ impl<ReleaseContext> MappingLifecycleState<ReleaseContext> {
         action: &str,
         version: u64,
     ) -> MappingLifecycleStart<ReleaseContext> {
-        if self.current_version(action) != version {
+        if self.current_version(action) != version || self.pending_starts.get(action) != Some(&version) {
             return MappingLifecycleStart::Stale;
         }
 

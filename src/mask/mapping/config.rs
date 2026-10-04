@@ -532,13 +532,14 @@ fn collect_mapping_specific_diagnostics(
     mapping_id: &str,
 ) {
     match mapping {
-        MappingType::SingleTap(mapping) => collect_script_hook_diagnostics(
-            diagnostics,
-            mapping_type,
-            mapping_index,
-            mapping_id,
-            &mapping.script_hooks,
-        ),
+        MappingType::SingleTap(mapping) => {
+            if let Err(error) = mapping.validate_hold_jitter() {
+                diagnostics.push(MappingDiagnostic::mapping("mapping.singleTap.invalidHoldJitter",
+                    error, mapping_type, mapping_index, mapping_id));
+            }
+            collect_script_hook_diagnostics(diagnostics, mapping_type, mapping_index,
+                mapping_id, &mapping.script_hooks);
+        }
         MappingType::RepeatTap(mapping) => collect_script_hook_diagnostics(
             diagnostics,
             mapping_type,
@@ -618,6 +619,14 @@ fn collect_mapping_specific_diagnostics(
             &mapping.script_hooks,
         ),
         MappingType::Fps(mapping) => {
+            if !mapping.start_random_offset_x.is_finite() || !mapping.start_random_offset_y.is_finite()
+                || mapping.start_random_offset_x < 0.0 || mapping.start_random_offset_y < 0.0 {
+                diagnostics.push(MappingDiagnostic::mapping(
+                    "mapping.fps.invalidStartRandomRange",
+                    "FPS start random ranges must be finite and non-negative",
+                    mapping_type, mapping_index, mapping_id,
+                ));
+            }
             if mapping.position.x <= FPS_MARGIN as i32 || mapping.position.y <= FPS_MARGIN as i32 {
                 diagnostics.push(MappingDiagnostic::mapping(
                     "mapping.fps.invalidPosition",

@@ -38,6 +38,7 @@ import {
   setNewDisplayDpi,
   setAlwaysOnTop,
   setTitlebarVisible,
+  setVsync,
   setWebBindAddr,
   setAudioCodec,
   setAudioBitRate,
@@ -55,6 +56,7 @@ import {
 import { requestGet } from "../utils";
 import i18n, { languageOptions } from "../i18n";
 import { useMessageContext } from "../hooks";
+import RecoilSettings from "./RecoilSettings";
 import {
   BilibiliFilled,
   CloudSyncOutlined,
@@ -138,6 +140,7 @@ export default function Settings() {
 
   return (
     <div className="page-container">
+      <RecoilSettings />
       <section>
         <Flex align="start" justify="space-between">
           <h2 className="title-with-line" style={{ marginBottom: 0 }}>
@@ -176,6 +179,9 @@ export default function Settings() {
         </ItemBoxContainer>
         <h3 className="title-with-line-sub">{t("settings.title.mask")}</h3>
         <ItemBoxContainer className="mb-6">
+          <ItemBox label="垂直同步" tooltip="立即生效。开启时窗口更新受电脑显示器刷新节奏限制；关闭可提高输入处理频率，但可能增加CPU/GPU占用。">
+            <Switch checked={localConfig.vsync} onChange={(v) => dispatch(setVsync(v))} />
+          </ItemBox>
           <ItemBox label={t("settings.alwaysOnTop")}>
             <Switch
               checked={localConfig.alwaysOnTop}

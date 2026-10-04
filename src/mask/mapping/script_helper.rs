@@ -3,7 +3,7 @@ use std::{
     fmt,
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, atomic::{AtomicU64, Ordering}},
 };
 
 use bevy::{
@@ -38,6 +38,14 @@ use crate::tokio_tasks::TokioTasksRuntime;
 use crate::utils::ChannelSenderCS;
 
 pub enum ScriptRuntimeCommand {
+    RecoverFps {
+        id: String,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
+    SetPhonePointer {
+        enabled: bool,
+        ack: oneshot::Sender<Result<(), String>>,
+    },
     EnterFps {
         id: String,
         ack: oneshot::Sender<Result<(), String>>,
@@ -62,6 +70,8 @@ pub enum ScriptRuntimeCommand {
 
 #[derive(SystemParam)]
 pub struct ScriptRuntimeCastParams<'w> {
+    pointer: ResMut<'w, super::device_pointer::DevicePointer>,
+    ignore_motion: ResMut<'w, super::cursor::IgnoreFirstMotion>,
     active_cast: ResMut<'w, ActiveCastSpell>,
     block_direction_pad: ResMut<'w, BlockDirectionPad>,
     normal_cursor_capture: ResMut<'w, NormalCursorCapture>,
@@ -76,7 +86,15 @@ pub struct ScriptRuntimeCommandReceiver(pub crossbeam_channel::Receiver<ScriptRu
 type ScriptStateMap = HashMap<String, HashMap<String, Value>>;
 
 #[derive(Resource, Clone, Default)]
-pub struct ScriptSharedState(Arc<Mutex<ScriptStateMap>>);
+pub struct ScriptSharedState(Arc<Mutex<ScriptStateMap>>, Arc<AtomicU64>);
+
+impl ScriptSharedState {
+    pub fn generation(&self) -> u64 { self.1.load(Ordering::SeqCst) }
+    fn reset_for_recovery(&self) {
+        self.1.fetch_add(1, Ordering::SeqCst);
+        self.0.lock().unwrap().clear();
+    }
+}
 
 struct ScriptFuncContext<'a> {
     cs_tx: &'a broadcast::Sender<ScrcpyControlMsg>,
@@ -84,6 +102,15 @@ struct ScriptFuncContext<'a> {
     shared_state: ScriptSharedState,
     state_scope: String,
     original_size: Vec2,
+    generation: u64,
+}
+
+impl ScriptFuncContext<'_> {
+    fn ensure_current(&self, source: &str, span: &SourceSpan) -> Result<(), ScriptError> {
+        if self.shared_state.generation() != self.generation {
+            Err(ScriptError::from_span(span.clone(), source, "Script cancelled by control recovery"))
+        } else { Ok(()) }
+    }
 }
 
 enum ScriptAction {
@@ -118,11 +145,12 @@ enum ScriptAction {
 type EvalFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 async fn execute_script_action(
-    _source: &str,
-    _span: &SourceSpan,
+    source: &str,
+    span: &SourceSpan,
     ctx: &ScriptFuncContext<'_>,
     action: ScriptAction,
 ) -> Result<Value, ScriptError> {
+    ctx.ensure_current(source, span)?;
     match action {
         ScriptAction::Print { output } => {
             log::info!("{}", output);
@@ -146,6 +174,7 @@ async fn execute_script_action(
 
             if tap_default {
                 tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                ctx.ensure_current(source, span)?;
                 ControlMsgHelper::send_touch(
                     ctx.cs_tx,
                     MotionEventAction::Up,
@@ -176,6 +205,7 @@ async fn execute_script_action(
                     interval,
                 );
                 for step in steps {
+                    ctx.ensure_current(source, span)?;
                     ControlMsgHelper::send_touch(
                         ctx.cs_tx,
                         MotionEventAction::Move,
@@ -187,6 +217,7 @@ async fn execute_script_action(
                 }
                 cur_pos = next_pos;
             }
+            ctx.ensure_current(source, span)?;
             ControlMsgHelper::send_touch(
                 ctx.cs_tx,
                 MotionEventAction::Up,
@@ -289,7 +320,7 @@ pub fn handle_script_runtime_commands(
     mapping_state: Res<State<MappingState>>,
     cursor_state: Res<State<CursorState>>,
     mut next_cursor_state: ResMut<NextState<CursorState>>,
-    cursor_pos: Res<CursorPosition>,
+    mut cursor_pos: ResMut<CursorPosition>,
     mask_size: Res<MaskSize>,
     mut active_fire_map: ResMut<ActiveFireMap>,
     mut next_mapping_state: ResMut<NextState<MappingState>>,
@@ -298,6 +329,70 @@ pub fn handle_script_runtime_commands(
 ) {
     for command in command_rx.0.try_iter() {
         match command {
+            ScriptRuntimeCommand::RecoverFps { id, ack } => {
+                let Some(config) = active_mapping.0.as_ref() else {
+                    ack_immediately(ack, Err("recover_fps requires an active layout".into()));
+                    continue;
+                };
+                let mapping = config.mapping_id_actions.get(&id)
+                    .and_then(|action| config.mappings.get(action));
+                let Some(BindMappingType::Fps(mapping)) = mapping else {
+                    ack_immediately(ack, Err(format!("recover_fps requires a valid FPS mapping id: {id}")));
+                    continue;
+                };
+                let mapping = mapping.clone();
+                let original_size: Vec2 = config.original_size.into();
+                shared_state.reset_for_recovery();
+                cast_params.pointer.stop(&cs_tx_res);
+                next_mapping_state.set(MappingState::Stop);
+                // Discard commands queued by scripts before recovery. Their generation is now stale.
+                for queued in command_rx.0.try_iter() {
+                    let ack = match queued {
+                        ScriptRuntimeCommand::RecoverFps { ack, .. }
+                        | ScriptRuntimeCommand::SetPhonePointer { ack, .. }
+                        | ScriptRuntimeCommand::EnterFps { ack, .. }
+                        | ScriptRuntimeCommand::ExitFps { ack }
+                        | ScriptRuntimeCommand::EnterRawInput { ack }
+                        | ScriptRuntimeCommand::ExitRawInput { ack }
+                        | ScriptRuntimeCommand::CancelCast { ack, .. }
+                        | ScriptRuntimeCommand::ReleaseCast { ack } => ack,
+                    };
+                    ack_immediately(ack, Err("Script cancelled by control recovery".into()));
+                }
+                runtime.spawn_background_task(move |mut ctx| async move {
+                    // Let the existing Stop transition release mappings and cancel their queues/timers.
+                    ctx.sleep_updates(2).await;
+                    ctx.run_on_main_thread(move |main| {
+                        let world = &mut *main.world;
+                        let sender = world.resource::<ChannelSenderCS>().0.clone();
+                        ControlMsgHelper::release_all_touches(&sender);
+                        let mask = world.resource::<MaskSize>().0;
+                        world.resource_scope(|world: &mut bevy::prelude::World, mut fps: bevy::prelude::Mut<ActiveCursorFpsConfig>| {
+                            let mut next = world.resource_mut::<NextState<CursorState>>();
+                            enter_fps_mode(&sender, &mut fps, &mut next, &mapping, original_size, mask);
+                        });
+                        let anchor = world.resource::<ActiveCursorFpsConfig>().original_pos;
+                        world.resource_mut::<CursorPosition>().0 = anchor / original_size * mask;
+                        world.resource_mut::<super::cursor::IgnoreFirstMotion>().0 = true;
+                        world.resource_mut::<NextState<MappingState>>().set(MappingState::Normal);
+                        log::info!("[Recovery] Released touches, cleared script state, restored FPS view");
+                    }).await;
+                    ctx.sleep_updates(1).await;
+                    ack_immediately(ack, Ok(()));
+                });
+            }
+            ScriptRuntimeCommand::SetPhonePointer { enabled, ack } => {
+                if *cursor_state.get() != CursorState::Fps {
+                    ack_immediately(ack, Err("phone pointer requires FPS master mode".to_string()));
+                    continue;
+                }
+                let result = super::device_pointer::set_pointer_mode(
+                    enabled, Vec2::splat(0.5), &mut cast_params.pointer,
+                    &mut fps_config, &mut cursor_pos, mask_size.0, &cs_tx_res,
+                    &mut cast_params.ignore_motion,
+                );
+                ack_after_next_update(&runtime, ack, result);
+            }
             ScriptRuntimeCommand::EnterFps { id, ack } => {
                 let Some(active_mapping) = &active_mapping.0 else {
                     let message = "[Script] enter_fps failed: no active mapping config".to_string();
@@ -347,6 +442,7 @@ pub fn handle_script_runtime_commands(
                     &mut next_cursor_state,
                     mapping,
                     active_mapping.original_size.into(),
+                    mask_size.0,
                 );
                 ack_after_next_update(&runtime, ack, Ok(()));
             }
@@ -1687,6 +1783,7 @@ impl ScriptAST {
             shared_state: shared_state.clone(),
             state_scope: state_scope.to_string(),
             original_size,
+            generation: shared_state.1.load(Ordering::SeqCst),
         };
 
         for stmt in self.program.stmts.iter() {
@@ -2123,10 +2220,12 @@ impl ScriptAST {
         name: &str,
         args: &[Value],
     ) -> Result<Value, ScriptError> {
+        ctx.ensure_current(source, span)?;
         match name {
             "print" => print_func(ctx, source, span, args).await,
             "wait" => wait_func(ctx, source, span, args).await,
             "tap" => tap_func(ctx, source, span, args).await,
+            "tap_random" => tap_random_func(ctx, source, span, args).await,
             "swipe" => swipe_func(ctx, source, span, args).await,
             "send_key" => send_key_func(ctx, source, span, args).await,
             "paste_text" => paste_text_func(ctx, source, span, args).await,
@@ -2136,7 +2235,10 @@ impl ScriptAST {
             "state_delete" => state_delete_func(ctx, source, span, args).await,
             "state_clear" => state_clear_func(ctx, source, span, args).await,
             "enter_fps" => enter_fps_func(ctx, source, span, args).await,
+            "recover_fps" => recover_fps_func(ctx, source, span, args).await,
             "exit_fps" => exit_fps_func(ctx, source, span, args).await,
+            "enter_phone_pointer" => phone_pointer_func(ctx, source, span, args, true).await,
+            "exit_phone_pointer" => phone_pointer_func(ctx, source, span, args, false).await,
             "enter_raw_input" => enter_raw_input_func(ctx, source, span, args).await,
             "exit_raw_input" => exit_raw_input_func(ctx, source, span, args).await,
             "cancel_cast" => cancel_cast_func(ctx, source, span, args).await,
@@ -2408,6 +2510,16 @@ impl<'a> ScriptAnalyzer<'a> {
                 self.expect_non_negative_int(args, 0, name, span);
                 ExprInfo::new(StaticType::Int)
             }
+            "tap_random" => {
+                self.expect_arity(name, args.len(), 5, Some(5), span);
+                for index in 0..5 {
+                    self.expect_type(args, index, StaticType::Int, name, span);
+                }
+                for index in [0, 3, 4] {
+                    self.expect_non_negative_int(args, index, name, span);
+                }
+                ExprInfo::new(StaticType::Int)
+            }
             "tap" => {
                 self.expect_arity(name, args.len(), 3, Some(4), span);
                 for index in 0..3 {
@@ -2472,13 +2584,15 @@ impl<'a> ScriptAnalyzer<'a> {
                 ExprInfo::new(StaticType::Int)
             }
             "state_set" => {
-                self.expect_arity(name, args.len(), 2, Some(2), span);
+                self.expect_arity(name, args.len(), 2, Some(3), span);
                 self.expect_non_empty_string(args, 0, name, span);
+                if args.len() == 3 { self.expect_non_empty_string(args, 2, name, span); }
                 ExprInfo::new(StaticType::Int)
             }
             "state_get" => {
-                self.expect_arity(name, args.len(), 2, Some(2), span);
+                self.expect_arity(name, args.len(), 2, Some(3), span);
                 self.expect_non_empty_string(args, 0, name, span);
+                if args.len() == 3 { self.expect_non_empty_string(args, 2, name, span); }
                 args.get(1)
                     .cloned()
                     .unwrap_or_else(|| ExprInfo::new(StaticType::Unknown))
@@ -2488,11 +2602,12 @@ impl<'a> ScriptAnalyzer<'a> {
                 self.expect_non_empty_string(args, 0, name, span);
                 ExprInfo::new(StaticType::Bool)
             }
-            "state_clear" | "exit_fps" | "enter_raw_input" | "exit_raw_input" | "release_cast" => {
+            "state_clear" | "exit_fps" | "enter_raw_input" | "exit_raw_input" | "release_cast"
+            | "enter_phone_pointer" | "exit_phone_pointer" => {
                 self.expect_arity(name, args.len(), 0, Some(0), span);
                 ExprInfo::new(StaticType::Int)
             }
-            "enter_fps" | "cancel_cast" => {
+            "enter_fps" | "recover_fps" | "cancel_cast" => {
                 self.expect_arity(name, args.len(), 1, Some(1), span);
                 self.expect_non_empty_string(args, 0, name, span);
                 ExprInfo::new(StaticType::Int)
@@ -2738,6 +2853,32 @@ async fn wait_func(
     execute_script_action(source, span, ctx, ScriptAction::Wait { ms }).await
 }
 
+async fn tap_random_func(
+    ctx: &ScriptFuncContext<'_>,
+    source: &str,
+    span: &SourceSpan,
+    args: &[Value],
+) -> Result<Value, ScriptError> {
+    match args {
+        [Value::Int(p), Value::Int(x), Value::Int(y), Value::Int(rx), Value::Int(ry)]
+            if *p >= 0 && *rx >= 0 && *ry >= 0 =>
+        {
+            let position = crate::mask::mapping::utils::random_offset_vec2(
+                Vec2::new(*x as f32, *y as f32),
+                Vec2::new(*rx as f32, *ry as f32),
+            ).clamp(Vec2::ZERO, ctx.original_size - Vec2::ONE);
+            execute_script_action(source, span, ctx, ScriptAction::Touch {
+                pointer_id: *p as u64,
+                action: MotionEventAction::Down,
+                position,
+                tap_default: true,
+            }).await
+        }
+        _ => Err(ScriptError::from_span(span.clone(), source,
+            "tap_random requires 5 integers: pointer_id, x, y, offset_x, offset_y; pointer_id and offsets must be non-negative".to_string())),
+    }
+}
+
 async fn tap_func(
     ctx: &ScriptFuncContext<'_>,
     source: &str,
@@ -2882,16 +3023,22 @@ async fn state_set_func(
     span: &SourceSpan,
     args: &[Value],
 ) -> Result<Value, ScriptError> {
-    let (name, value) = match args {
+    let (name, value, scope) = match args {
         [name, value] => (
             expect_state_name_arg(source, span, name, "state_set")?,
             value,
+            ctx.state_scope.as_str(),
+        ),
+        [name, value, scope] => (
+            expect_state_name_arg(source, span, name, "state_set")?,
+            value,
+            expect_state_name_arg(source, span, scope, "state_set scope")?,
         ),
         _ => {
             return Err(ScriptError::from_span(
                 span.clone(),
                 source,
-                "The state_set function takes two arguments: name (non-empty string), value"
+                "The state_set function takes 2-3 arguments: name (non-empty string), value, scope (optional non-empty string)"
                     .to_string(),
             ));
         }
@@ -2899,7 +3046,7 @@ async fn state_set_func(
 
     let mut shared_state = lock_shared_state(ctx, source, span)?;
     shared_state
-        .entry(ctx.state_scope.clone())
+        .entry(scope.to_string())
         .or_default()
         .insert(name.to_string(), value.clone());
     Ok(Value::Int(0))
@@ -2911,16 +3058,22 @@ async fn state_get_func(
     span: &SourceSpan,
     args: &[Value],
 ) -> Result<Value, ScriptError> {
-    let (name, default_value) = match args {
+    let (name, default_value, scope) = match args {
         [name, default_value] => (
             expect_state_name_arg(source, span, name, "state_get")?,
             default_value,
+            ctx.state_scope.as_str(),
+        ),
+        [name, default_value, scope] => (
+            expect_state_name_arg(source, span, name, "state_get")?,
+            default_value,
+            expect_state_name_arg(source, span, scope, "state_get scope")?,
         ),
         _ => {
             return Err(ScriptError::from_span(
                 span.clone(),
                 source,
-                "The state_get function takes two arguments: name (non-empty string), default_value"
+                "The state_get function takes 2-3 arguments: name (non-empty string), default_value, scope (optional non-empty string)"
                     .to_string(),
             ));
         }
@@ -2928,7 +3081,7 @@ async fn state_get_func(
 
     let shared_state = lock_shared_state(ctx, source, span)?;
     Ok(shared_state
-        .get(&ctx.state_scope)
+        .get(scope)
         .and_then(|scope| scope.get(name))
         .cloned()
         .unwrap_or_else(|| default_value.clone()))
@@ -2996,6 +3149,15 @@ async fn state_clear_func(
     Ok(Value::Int(0))
 }
 
+async fn recover_fps_func(
+    ctx: &ScriptFuncContext<'_>, source: &str, span: &SourceSpan, args: &[Value],
+) -> Result<Value, ScriptError> {
+    let id = expect_id_arg_func(source, span, args, "recover_fps")?;
+    execute_runtime_command(source, span, ctx, |ack| ScriptRuntimeCommand::RecoverFps {
+        id: id.to_string(), ack,
+    }).await
+}
+
 async fn enter_fps_func(
     ctx: &ScriptFuncContext<'_>,
     source: &str,
@@ -3021,6 +3183,14 @@ async fn exit_fps_func(
         ack,
     })
     .await
+}
+
+async fn phone_pointer_func(
+    ctx: &ScriptFuncContext<'_>, source: &str, span: &SourceSpan,
+    args: &[Value], enabled: bool,
+) -> Result<Value, ScriptError> {
+    expect_no_args_func(source, span, args, if enabled { "enter_phone_pointer" } else { "exit_phone_pointer" })?;
+    execute_runtime_command(source, span, ctx, |ack| ScriptRuntimeCommand::SetPhonePointer { enabled, ack }).await
 }
 
 async fn enter_raw_input_func(
@@ -3581,6 +3751,83 @@ pub struct Program {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn recovery_clears_menu_states_and_cancels_delayed_script_touch() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let (commands, _) = crossbeam_channel::unbounded();
+        let shared = ScriptSharedState::default();
+        let size = Vec2::splat(1000.0);
+        let map = ScriptAST::new("state_set(\"map_open\", true); state_set(\"bag_open\", true, \"bag\"); wait(40); tap(54, 100, 100)").unwrap();
+        let reset = async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            shared.reset_for_recovery();
+        };
+        let (result, _) = tokio::join!(map.run_script(&tx, &commands, &shared, "map", size, Vec2::ZERO, size, false, true), reset);
+        assert!(result.unwrap_err().to_string().contains("cancelled by control recovery"));
+        assert!(shared.0.lock().unwrap().is_empty());
+        assert!(rx.try_recv().is_err());
+        assert!(ScriptAST::new("recover_fps(\"view\")").is_ok());
+        assert!(ScriptAST::new("recover_fps()").is_err());
+        assert!(ScriptAST::new("recover_fps(\"\")").is_err());
+    }
+    #[tokio::test]
+    async fn digit_hooks_sync_wheel_scope_without_changing_local_state() {
+        let (tx, _rx) = broadcast::channel(8);
+        let (commands, _) = crossbeam_channel::unbounded();
+        let shared = ScriptSharedState::default();
+        let size = Vec2::splat(200.0);
+        for slot in 1..=5 {
+            let next = slot % 5 + 1;
+            let ast = ScriptAST::new(&format!("state_set(\"next_item\", {next}, \"wheel\"); state_set(\"local\", 99)")).unwrap();
+            ast.run_script(&tx, &commands, &shared, "digit", size, Vec2::ZERO, size, false, false).await.unwrap();
+            let ast = ScriptAST::new("state_set(\"observed\", state_get(\"next_item\", 1))").unwrap();
+            ast.run_script(&tx, &commands, &shared, "wheel", size, Vec2::ZERO, size, false, false).await.unwrap();
+            let states = shared.0.lock().unwrap();
+            assert!(matches!(states["wheel"]["observed"], Value::Int(v) if v == next));
+            assert!(matches!(states["digit"]["local"], Value::Int(99)));
+            assert!(!states["digit"].contains_key("next_item"));
+        }
+        assert!(ScriptAST::new("state_set(\"x\", 1, \"\")").is_err());
+    }
+    #[test]
+    fn random_tap_validates_offsets() {
+        assert!(super::ScriptAST::new("tap_random(1, 100, 100, 10, 10)").is_ok());
+        for script in ["tap_random(1, 100, 100, -1, 10)", "tap_random(1, 100, 100, 10)", "tap_random(1, 100, 100, 10, false)"] {
+            assert!(super::ScriptAST::new(script).is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn random_tap_keeps_down_up_at_same_bounded_position() {
+        let (tx, mut rx) = broadcast::channel(8);
+        let (commands, _) = crossbeam_channel::unbounded();
+        let size = Vec2::new(200.0, 200.0);
+        for (x, y, range) in [(100, 100, 10), (0, 199, 10), (100, 100, 0)] {
+            let ast = ScriptAST::new(&format!("tap_random(54, {x}, {y}, {range}, {range})")).unwrap();
+            ast.run_script(&tx, &commands, &ScriptSharedState::default(), "test", size, Vec2::ZERO, size, false, false).await.unwrap();
+            let mut positions = Vec::new();
+            for expected in [MotionEventAction::Down, MotionEventAction::Up] {
+                match rx.try_recv().unwrap() {
+                    ScrcpyControlMsg::InjectTouchEvent { action, pointer_id, x: px, y: py, .. } => {
+                        assert_eq!(action, expected);
+                        assert_eq!(pointer_id, 54);
+                        assert!((px - x).abs() <= range && (py - y).abs() <= range);
+                        assert!((0..200).contains(&px) && (0..200).contains(&py));
+                        positions.push((px, py));
+                    }
+                    _ => panic!("Expected touch event"),
+                }
+            }
+            assert_eq!(positions[0], positions[1]);
+        }
+    }
+
+    #[test]
+    fn phone_pointer_commands_are_validated_as_zero_argument_functions() {
+        assert!(super::ScriptAST::validate_source("enter_phone_pointer(); exit_phone_pointer();").is_ok());
+        assert!(super::ScriptAST::validate_source("enter_phone_pointer(1);").is_err());
+        assert!(super::ScriptAST::validate_source("exit_phone_pointer(1);").is_err());
+    }
     use super::*;
 
     fn expect_let_expr<'a>(stmt: &'a Stmt, name: &str) -> &'a Expr {

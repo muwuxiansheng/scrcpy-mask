@@ -34,6 +34,8 @@ pub fn routers(
     Router::new()
         .route("/get_config", get(get_config))
         .route("/update_config", post(update_config))
+        .route("/restore_window", post(restore_window))
+        .route("/recoil_status", get(recoil_status))
         .route("/open_data_path", get(open_data_path))
         .route("/get_update_info", get(get_update_info))
         .route("/check_update", get(check_update))
@@ -46,6 +48,21 @@ async fn get_config() -> Result<JsonResponse, WebServerError> {
         t!("web.config.getLocalConfigSuccess"),
         Some(serde_json::to_value(&config).unwrap()),
     ))
+}
+
+async fn recoil_status() -> JsonResponse {
+    JsonResponse::success("压枪状态", Some(serde_json::to_value(crate::mask::mapping::recoil::status()).unwrap()))
+}
+
+async fn restore_window(State(state): State<AppStatConfig>) -> Result<JsonResponse, WebServerError> {
+    let (tx, rx) = oneshot::channel();
+    state.m_tx.send((MaskCommand::RestoreWindow, tx))
+        .map_err(|e| WebServerError::internal_error(e.to_string()))?;
+    let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx).await
+        .map_err(|_| WebServerError::internal_error("恢复窗口超时"))?
+        .map_err(|e| WebServerError::internal_error(e.to_string()))?
+        .map_err(WebServerError::bad_request)?;
+    Ok(JsonResponse::success(result, None))
 }
 
 async fn open_data_path() -> Result<JsonResponse, WebServerError> {
@@ -130,6 +147,13 @@ async fn update_config(
 ) -> Result<JsonResponse, WebServerError> {
     // sync with src/config.rs
     match payload.key.as_str() {
+        "recoil" => {
+            let config: crate::mask::mapping::recoil::RecoilConfig = serde_json::from_value(payload.value)
+                .map_err(|e| WebServerError::bad_request(e.to_string()))?;
+            config.validate().map_err(WebServerError::bad_request)?;
+            LocalConfig::set_recoil(config);
+            return Ok(JsonResponse::success("压枪设置已保存，松开开火键后按新方案生效", None));
+        }
         "language" => {
             if let Some(value) = payload.value.as_str() {
                 if !is_available_language(value) {
@@ -259,6 +283,13 @@ async fn update_config(
                     "web.config.alwaysOnTopMustBeBool"
                 )));
             }
+        }
+        "vsync" => {
+            let Some(value) = payload.value.as_bool() else {
+                return Err(WebServerError::bad_request("vsync must be a boolean"));
+            };
+            LocalConfig::set_vsync(value);
+            return Ok(JsonResponse::success("垂直同步设置已更新，立即生效", None));
         }
         "titlebar_visible" => {
             if let Some(value) = payload.value.as_bool() {

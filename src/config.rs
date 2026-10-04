@@ -3,7 +3,7 @@ use std::{
     io::Write,
     net::Ipv4Addr,
     path::PathBuf,
-    sync::RwLock,
+    sync::{Arc, RwLock},
 };
 
 use crate::{
@@ -18,6 +18,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::to_string_pretty;
 
 static CONFIG: Lazy<RwLock<LocalConfig>> = Lazy::new(|| RwLock::default());
+static RECOIL: Lazy<RwLock<Arc<crate::mask::mapping::recoil::RecoilConfig>>> =
+    Lazy::new(|| RwLock::new(Arc::new(Default::default())));
 
 pub const AUDIO_BIT_RATE_MIN: u32 = 16_000;
 
@@ -46,6 +48,7 @@ fn default_adb_path() -> String {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LocalConfig {
+    pub recoil: crate::mask::mapping::recoil::RecoilConfig,
     // port
     pub web_port: u16,
     #[serde(default = "default_web_bind_addr")]
@@ -57,6 +60,7 @@ pub struct LocalConfig {
     // mask
     pub always_on_top: bool,
     pub titlebar_visible: bool,
+    pub vsync: bool,
     pub vertical_mask_height: u32,
     pub horizontal_mask_width: u32,
     pub vertical_position: (i32, i32),
@@ -93,6 +97,7 @@ pub struct LocalConfig {
 impl Default for LocalConfig {
     fn default() -> Self {
         Self {
+            recoil: Default::default(),
             adb_path: default_adb_path(),
             adb_connect_address: String::new(),
             web_port: 27799,
@@ -100,6 +105,7 @@ impl Default for LocalConfig {
             controller_port: 27798,
             always_on_top: true,
             titlebar_visible: true,
+            vsync: false,
             vertical_mask_height: 720,
             horizontal_mask_width: 1280,
             vertical_position: (100, 100),
@@ -181,14 +187,30 @@ impl LocalConfig {
                 e
             )
         })?;
-        let config: LocalConfig = serde_json::from_str(&config_string)
+        let mut config: LocalConfig = serde_json::from_str(&config_string)
             .map_err(|e| format!("{}: {}", t!("localConfig.serializeConfigError"), e))?;
+        if let Err(error) = config.recoil.validate() {
+            log::warn!("[Recoil] Invalid saved config: {error}; using disabled defaults");
+            config.recoil = Default::default();
+        }
+        *RECOIL.write().unwrap() = Arc::new(config.recoil.clone());
         *CONFIG.write().unwrap() = config;
         Ok(())
     }
 
     pub fn get() -> LocalConfig {
         CONFIG.read().unwrap().clone()
+    }
+    pub fn get_vsync() -> bool {
+        CONFIG.read().unwrap().vsync
+    }
+    pub fn get_recoil() -> Arc<crate::mask::mapping::recoil::RecoilConfig> {
+        RECOIL.read().unwrap().clone()
+    }
+    pub fn set_recoil(value: crate::mask::mapping::recoil::RecoilConfig) {
+        CONFIG.write().unwrap().recoil = value.clone();
+        *RECOIL.write().unwrap() = Arc::new(value);
+        Self::save().unwrap();
     }
 
     pub fn get_clipboard_sync() -> bool {
@@ -202,6 +224,7 @@ impl LocalConfig {
         (adb_path, String),
         (adb_connect_address, String),
         (always_on_top, bool),
+        (vsync, bool),
         (titlebar_visible, bool),
         (vertical_mask_height, u32),
         (horizontal_mask_width, u32),

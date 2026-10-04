@@ -6,8 +6,11 @@ pub mod device_pointer;
 pub mod direction_pad;
 pub mod executor;
 pub mod fire;
+pub mod fps_diagnostics;
+mod fps_output;
 pub mod observation;
 pub mod raw_input;
+pub mod recoil;
 pub mod script;
 pub mod script_helper;
 pub mod serde_float;
@@ -47,7 +50,7 @@ pub struct MappingPlugins;
 
 impl Plugin for MappingPlugins {
     fn build(&self, app: &mut App) {
-        app.add_plugins((IneffablePlugin, CursorPlugins))
+        app.add_plugins((IneffablePlugin, CursorPlugins, recoil::RecoilPlugin))
             .insert_state(MappingState::Stop)
             .insert_resource(ActiveMappingConfig(None, String::new()))
             .register_input_action::<MappingAction>()

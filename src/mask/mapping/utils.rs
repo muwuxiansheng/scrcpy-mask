@@ -1,7 +1,8 @@
 use std::{
+    collections::HashMap,
     ops::MulAssign,
     sync::{
-        Arc,
+        Arc, LazyLock, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -73,7 +74,56 @@ impl MulAssign<Vec2> for Position {
 
 pub struct ControlMsgHelper;
 
+struct TouchSession {
+    sender: broadcast::WeakSender<ScrcpyControlMsg>,
+    touches: HashMap<u64, (Vec2, Vec2)>,
+}
+
+static TOUCH_SESSIONS: LazyLock<Mutex<Vec<TouchSession>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    #[test]
+    fn emergency_release_covers_script_ids_and_preserves_other_channels() {
+        let (tx, mut rx) = broadcast::channel(32);
+        let (other, mut other_rx) = broadcast::channel(8);
+        let size = Vec2::splat(1000.0);
+        for id in [0, 1, 7, 54, 58] {
+            ControlMsgHelper::send_touch(&tx, MotionEventAction::Down, id, size, Vec2::splat(100.0));
+            rx.try_recv().unwrap();
+        }
+        ControlMsgHelper::send_touch(&tx, MotionEventAction::Move, 54, size, Vec2::new(150.0, 200.0));
+        rx.try_recv().unwrap();
+        ControlMsgHelper::send_touch(&other, MotionEventAction::Down, 54, size, Vec2::splat(900.0));
+        other_rx.try_recv().unwrap();
+        ControlMsgHelper::release_all_touches(&tx);
+        let mut ids = Vec::new();
+        for _ in 0..5 {
+            match rx.try_recv().unwrap() {
+                ScrcpyControlMsg::InjectTouchEvent { action, pointer_id, x, y, .. } => {
+                    assert_eq!(action, MotionEventAction::Up);
+                    if pointer_id == 54 { assert_eq!((x,y), (150,200)); }
+                    ids.push(pointer_id);
+                }
+                _ => panic!("Expected touch up"),
+            }
+        }
+        ids.sort();
+        assert_eq!(ids, [0,1,7,54,58]);
+        ControlMsgHelper::release_all_touches(&tx);
+        assert!(rx.try_recv().is_err());
+        assert!(other_rx.try_recv().is_err());
+        ControlMsgHelper::release_all_touches(&other);
+        assert!(other_rx.try_recv().is_ok());
+    }
+}
+
 impl ControlMsgHelper {
+    pub fn touch_id_in_use(cs_tx: &broadcast::Sender<ScrcpyControlMsg>, id: u64) -> bool {
+        TOUCH_SESSIONS.lock().unwrap().iter().any(|s|
+            s.sender.upgrade().is_some_and(|tx| tx.same_channel(cs_tx)) && s.touches.contains_key(&id))
+    }
     pub fn send_touch(
         cs_tx: &broadcast::Sender<ScrcpyControlMsg>,
         action: MotionEventAction,
@@ -81,7 +131,14 @@ impl ControlMsgHelper {
         size: Vec2,
         pos: Vec2,
     ) {
-        if let Err(e) = cs_tx.send(ScrcpyControlMsg::InjectTouchEvent {
+        let mut sessions = TOUCH_SESSIONS.lock().unwrap();
+        sessions.retain(|s| s.sender.upgrade().is_some());
+        let index = sessions.iter().position(|s| s.sender.upgrade().is_some_and(|tx| tx.same_channel(cs_tx)))
+            .unwrap_or_else(|| {
+                sessions.push(TouchSession { sender: cs_tx.downgrade(), touches: HashMap::new() });
+                sessions.len() - 1
+            });
+        let message = ScrcpyControlMsg::InjectTouchEvent {
             action,
             pointer_id,
             x: pos.x as i32,
@@ -91,8 +148,31 @@ impl ControlMsgHelper {
             pressure: half::f16::from_f32_const(1.0),
             action_button: MotionEventButtons::PRIMARY,
             buttons: MotionEventButtons::PRIMARY,
-        }) {
+        };
+        if let Err(e) = cs_tx.send(message) {
             log::warn!("[Mapping] send_touch failed: {}", e);
+        } else {
+            match action {
+                MotionEventAction::Down => { sessions[index].touches.insert(pointer_id, (size, pos)); }
+                MotionEventAction::Move => {
+                    if let Some(touch) = sessions[index].touches.get_mut(&pointer_id) { *touch = (size, pos); }
+                }
+                MotionEventAction::Up => { sessions[index].touches.remove(&pointer_id); }
+            }
+        }
+    }
+
+    /// Releases every outstanding injected touch, including script-created pointer IDs.
+    pub fn release_all_touches(cs_tx: &broadcast::Sender<ScrcpyControlMsg>) {
+        let mut sessions = TOUCH_SESSIONS.lock().unwrap();
+        let Some(session) = sessions.iter_mut().find(|s| s.sender.upgrade().is_some_and(|tx| tx.same_channel(cs_tx))) else { return; };
+        for (pointer_id, (size, pos)) in session.touches.drain() {
+            let _ = cs_tx.send(ScrcpyControlMsg::InjectTouchEvent {
+                action: MotionEventAction::Up, pointer_id,
+                x: pos.x as i32, y: pos.y as i32, w: size.x as u16, h: size.y as u16,
+                pressure: half::f16::from_f32_const(1.0),
+                action_button: MotionEventButtons::PRIMARY, buttons: MotionEventButtons::PRIMARY,
+            });
         }
     }
 

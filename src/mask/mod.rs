@@ -9,12 +9,13 @@ use bevy::{
     app::{App, Plugin, Startup, Update},
     ecs::{
         message::MessageReader,
-        system::{Commands, Local, Res, ResMut, Single},
+        system::{Commands, Local, NonSendMarker, Res, ResMut, Single},
     },
     math::Vec2,
-    prelude::{ButtonInput, IntoScheduleConfigs, MouseButton, Resource, SystemSet},
+    prelude::{ButtonInput, Entity, IntoScheduleConfigs, MouseButton, Resource, SystemSet},
     time::{Time, Timer, TimerMode},
     window::{Window, WindowMoved, WindowPosition, WindowResized},
+    winit::WINIT_WINDOWS,
 };
 use bevy_ui_render::prelude::UiMaterialPlugin;
 
@@ -101,6 +102,11 @@ impl Default for MaskResizeState {
 }
 
 impl MaskResizeState {
+    fn cancel(&mut self) {
+        self.active = false;
+        self.pending_apply = false;
+        self.timer.reset();
+    }
     pub fn begin_interaction(&mut self) {
         self.active = true;
         self.timer.reset();
@@ -153,14 +159,24 @@ fn sync_mask_size(
     mut resize_reader: MessageReader<WindowResized>,
     titlebar_state: Res<TitlebarState>,
     mut mask_size: ResMut<MaskSize>,
-    mut window: Single<&mut Window>,
+    mut window: Single<(Entity, &mut Window)>,
+    _main_thread: NonSendMarker,
     time: Res<Time>,
     mouse_input: Res<ButtonInput<MouseButton>>,
     mut resize_state: ResMut<MaskResizeState>,
     ws_tx: Res<ChannelSenderWS>,
 ) {
+    let (entity, window) = &mut *window;
+    let minimized = WINIT_WINDOWS.with_borrow(|windows| windows.get_window(*entity)
+        .and_then(|w| w.is_minimized()).unwrap_or(false));
+    if !window_geometry_is_valid(window.size(), window.position, minimized) {
+        resize_reader.clear();
+        resize_state.cancel();
+        return;
+    }
     for e in resize_reader.read() {
         let h = (e.height - titlebar_state.offset()).max(0.0);
+        if e.width < 200.0 || h < 80.0 { continue; }
         mask_size.0 = Vec2::new(e.width, h);
         resize_state.mark_resized();
     }
@@ -231,13 +247,22 @@ fn sync_mask_size(
 
 fn sync_mask_position(
     mut move_reader: MessageReader<WindowMoved>,
-    window: Single<&Window>,
+    window: Single<(Entity, &Window)>,
+    _main_thread: NonSendMarker,
     titlebar_state: Res<TitlebarState>,
     time: Res<Time>,
     mut debounce: Local<MoveDebounce>,
     ws_tx: Res<ChannelSenderWS>,
 ) {
     debounce.ensure_init();
+    let (entity, window) = *window;
+    let minimized = WINIT_WINDOWS.with_borrow(|windows| windows.get_window(entity)
+        .and_then(|w| w.is_minimized()).unwrap_or(false));
+    if !window_geometry_is_valid(window.size(), window.position, minimized) {
+        move_reader.clear();
+        debounce.pending = false;
+        return;
+    }
 
     for _ in move_reader.read() {
         debounce.timer.reset();
@@ -256,11 +281,6 @@ fn sync_mask_position(
                 let WindowPosition::At(pos) = window.position else {
                     return;
                 };
-                // Windows reports this sentinel while minimized; it is not a saved desktop position.
-                #[cfg(target_os = "windows")]
-                if pos.x == -32000 && pos.y == -32000 {
-                    return;
-                }
                 let scale_factor = window.resolution.scale_factor() as f32;
                 let content_top = if titlebar_state.visible {
                     physical_to_logical_i32(pos.y, scale_factor) + TITLEBAR_HEIGHT.round() as i32
@@ -285,5 +305,51 @@ fn sync_mask_position(
                 }
             }
         }
+    }
+}
+
+fn window_geometry_is_valid(size: Vec2, position: WindowPosition, minimized: bool) -> bool {
+    if minimized || !size.is_finite() || size.x < 200.0 || size.y < 80.0 {
+        return false;
+    }
+    // Reject Windows' minimized coordinates, including values converted by DPI scaling.
+    !matches!(position, WindowPosition::At(pos) if pos.x <= -10000 || pos.y <= -10000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn geometry_systems_run_without_legacy_winit_resource_and_ignore_minimize_events() {
+        let mut app = App::new();
+        app.insert_resource(Time::<()>::default())
+            .insert_resource(TitlebarState { visible: true })
+            .insert_resource(MaskSize(Vec2::new(1000.0, 700.0)))
+            .insert_resource(MaskResizeState::default())
+            .insert_resource(ButtonInput::<MouseButton>::default())
+            .insert_resource(ChannelSenderWS(tokio::sync::broadcast::channel(8).0))
+            .add_message::<WindowResized>()
+            .add_message::<WindowMoved>()
+            .add_systems(Update, (sync_mask_size, sync_mask_position));
+        let entity = app.world_mut().spawn(Window {
+            position: WindowPosition::At((-32000, -32000).into()),
+            ..Default::default()
+        }).id();
+        app.world_mut().write_message(WindowResized { window: entity, width: 158.0, height: 28.0 });
+        app.world_mut().write_message(WindowMoved { window: entity, position: (-32000, -32000).into() });
+        app.update();
+        assert_eq!(app.world().resource::<MaskSize>().0, Vec2::new(1000.0, 700.0));
+        assert!(!app.world().resource::<MaskResizeState>().active());
+    }
+
+    #[test]
+    fn minimized_geometry_never_replaces_saved_window_geometry() {
+        for pos in [(-32000, -32000), (-21333, -21303)] {
+            assert!(!window_geometry_is_valid(Vec2::new(158.0, 28.0), WindowPosition::At(pos.into()), false));
+            assert!(!window_geometry_is_valid(Vec2::new(1000.0, 720.0), WindowPosition::At(pos.into()), false));
+        }
+        assert!(!window_geometry_is_valid(Vec2::new(1000.0, 720.0), WindowPosition::At((100, 100).into()), true));
+        assert!(window_geometry_is_valid(Vec2::new(1000.0, 720.0), WindowPosition::At((-1920, 100).into()), false));
     }
 }

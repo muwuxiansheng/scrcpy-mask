@@ -314,6 +314,18 @@ function ControlledDevices({
     dispatch(setIsLoading(false));
   }
 
+  async function restoreWindow() {
+    dispatch(setIsLoading(true));
+    try {
+      const res = await requestPost("/api/config/restore_window", {});
+      messageApi?.success(res.message);
+    } catch (error) {
+      messageApi?.error(error as string);
+    } finally {
+      dispatch(setIsLoading(false));
+    }
+  }
+
   const columns: TableProps<ControlledDevice>["columns"] = [
     {
       title: "ID",
@@ -443,6 +455,9 @@ function ControlledDevices({
             icon={<ReloadOutlined />}
             onClick={() => reconnectDevice(record.device_id)}
           />
+          {record.main && (
+            <Button size="small" onClick={restoreWindow}>恢复控制窗口</Button>
+          )}
           <IconButton
             tooltip={t("devices.controlledDevices.actionStartApp")}
             size={18}

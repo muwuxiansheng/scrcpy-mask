@@ -309,6 +309,14 @@ function Setting({
             />
           </Space.Compact>
         </ItemBox>
+        <ItemBox label="滑动起点随机范围" tooltip="手机坐标像素。每段新滑动（进入、回中、停顿后重新按下）只采样一次，滑动过程中不抖动。X/Y各在±范围内随机，并限制在原滑动边界内。填0关闭。">
+          <Space.Compact className="w-full">
+            <InputNumber className="w-full" prefix="X:" min={0} value={config.start_random_offset_x ?? 0}
+              onChange={(v) => v !== null && onConfigChange({ ...config, start_random_offset_x: v })} />
+            <InputNumber className="w-full" prefix="Y:" min={0} value={config.start_random_offset_y ?? 0}
+              onChange={(v) => v !== null && onConfigChange({ ...config, start_random_offset_y: v })} />
+          </Space.Compact>
+        </ItemBox>
         <ItemBox label={t("mappings.fps.setting.touchMode")} tooltip={t("mappings.fps.setting.touchModeHint")}>
           <Select
             className="w-full"
